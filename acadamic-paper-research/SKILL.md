@@ -30,22 +30,33 @@ metadata:
 ## Phase 0：目录规范
 
 所有论文分析放在 `~/Academics/`，每篇论文一个子文件夹：
+PDF 必须放子文件夹内，不能直接放 `~/Academics/` 根目录。
 
 ```
 ~/Academics/
 └── <paper-short-name>/
     ├── <paper-short-name>.pdf   ← 论文原文
-    ├── running_notes.md          ← 精炼笔记（翻译+要点，主产出）
-    ├── summary.md                ← 结构化总结（问题/方法/结果）
-    ├── critique.md               ← 优缺点与开放问题
-    └── notes.md                  ← 自由观察记录
+    └── running_notes.md          ← 精炼笔记（翻译+要点，主产出）
 ```
-
-**关键坑**：PDF 必须放子文件夹内，不能直接放 `~/Academics/` 根目录。
 
 ---
 
 ## Phase 1：PDF 文本提取
+
+### PDF 下载
+
+USENIX/ACM 会议论文优先从 proceedings 页面提取 PDF 链接：
+
+```bash
+# 从 USENIX proceedings 页面提取 PDF URL
+curl -sL "https://www.usenix.org/conference/<conf>/presentation/<slug>" \
+  | grep -oP 'https://www.usenix.org/system/files/[^"]*\.pdf' | head -3
+
+# 下载（curl 超时时用 wget 回退）
+wget -q -O /path/to/paper.pdf "<pdf_url>" -T 60
+```
+
+**关键坑**：curl 在代理/跨境网络下可能超时（30s 不够），直接用 `wget -T 60` 更可靠。
 
 ### 方法一：pdftotext（两栏论文推荐）
 
@@ -60,13 +71,13 @@ pdftotext -f N -l M paper.pdf /tmp/page.txt        # 逐页提取，阅读顺序
 ### 方法二：PyPDF2（通用 Python 方案）
 
 ```bash
-# 提取前 2 页（元数据阶段）
+# 提取前 3 页（元数据阶段）
 python3 -c "
 from PyPDF2 import PdfReader
 r = PdfReader('/path/to/paper.pdf')
-for i in range(min(2, len(r.pages))):
+for i in range(min(3, len(r.pages))):
     print(f'--- Page {i+1} ---')
-    print(r.pages[i].extract_text())
+    print(r.pages[i].extract_text()[:3000])
 "
 
 # 提取全部页（深度分析阶段）
@@ -82,6 +93,8 @@ for i in range(len(r.pages)):
 **安装**：`pip install PyPDF2 --break-system-packages -q`
 
 **重要**：PyPDF2 提取必须用 `terminal`，不能用 `execute_code`（沙箱 Python 环境不同）。
+
+> **加速长论文分析**：15+ 页论文可以用 `delegate_task` 并行派发章节给子代理同时阅读。详见 `references/parallel-analysis.md`。
 
 ---
 
@@ -111,12 +124,20 @@ for i in range(len(r.pages)):
 | 信息源 | 方法 |
 |--------|------|
 | 论文首页 | pdftotext page 1 或 PyPDF2 提取 |
-| DBLP | `curl -s "https://dblp.org/search/publ/api?q=TITLE&format=json"` |
-| USENIX proceedings | `curl -sL "https://www.usenix.org/conference/<conf>/presentation/<slug>" \| grep 'citation_'` |
+| USENIX proceedings | **最可靠来源**：`curl -sL "https://www.usenix.org/conference/<conf>/presentation/<slug>" \| grep 'citation_'` 提取全部作者+机构 |
+| DBLP | `curl -s "https://dblp.org/search/publ/api?q=TITLE&format=json"` — 论文元数据可靠，但**作者搜索常返回空结果** |
 | 通讯作者课题组 | 大学主页 (`cs.<univ>.edu.cn`) → Google Scholar → DBLP（按序尝试） |
 | 致谢部分（Acknowledgments） | PyPDF2 全页搜索 `acknowledg` 关键词（注意：部分 USENIX 论文无致谢段，不假设存在） |
 
-### 2.4 输出格式
+### 2.4 章节结构发现
+
+全文提取后，用 grep 快速定位论文章节：
+
+```bash
+grep -nE '^[0-9]+ [A-Z][a-z]' paper_fulltext.txt | head -50
+```
+
+### 2.5 输出格式
 
 ```
 ## 论文基本信息分析
@@ -164,6 +185,8 @@ for i in range(len(r.pages)):
 ### 3.4 笔记结构
 
 ```
+## 0. 论文概述
+```
 ## 论文一页版总结
 ### 基本信息
 - **标题**: ...
@@ -187,15 +210,12 @@ for i in range(len(r.pages)):
 ## 3. 设计（§3）
   3.1 ...
 ## 4. 实现/评估（§4-5）
-```
 
 ## Phase 4：深度分析
 
 元数据和翻译完成后，进行结构化深度分析。先询问用户关注的维度，默认覆盖：
 
-- **summary.md**：问题定义、方法/方案、关键结果
-- **critique.md**：优势、不足、开放问题、可复现性
-- **notes.md**：阅读过程中的零散观察
+- **critique.md**：优势、不足、开放问题、可复现性，以及阅读过程中的零散观察
 
 ---
 
@@ -204,11 +224,17 @@ for i in range(len(r.pages)):
 | 类别 | 注意点 |
 |------|--------|
 | PDF 提取 | PyPDF2 必须用 `terminal` 而非 `execute_code` |
+| PDF 下载 | curl 30s 超时不够 → 用 `wget -T 60` 回退 |
 | 目录 | PDF 必须放 `~/Academics/<name>/<name>.pdf`，不能放根目录 |
 | 笔记写入 | 用户可能自行编辑 → 每次写入前 `read_file` 确认当前状态 |
 | 章节重组 | 用户调整结构时快速响应，不抗拒 |
 | pdftotext | Windows 上用 git-bash 执行，非 PowerShell |
 | 待确认标记 | 保留用户添加的"待确认/待研究"首行标记，不覆盖 |
 | 联网搜索 | Subagent 搜索不可靠 → 优先用 `curl` 直接调用已知接口 |
+| DBLP 作者搜索 | DBLP 按作者名搜索常返回空结果，作者信息优先从 proceedings 页面 `citation_author` 提取 |
 | Google Scholar | 可能限速/CAPTCHA → 备选：大学主页、DBLP |
 | 致谢段 | 并非所有论文都有 Acknowledgments，不假设存在 |
+| 会议年记法 | 使用 ABBREV'YY 格式：NSDI'26、SIGCOMM'24（无空格，单引号） |
+
+> **参考案例**: `references/industrial-paper-example.md` — 高作者数工业论文分析示例
+
