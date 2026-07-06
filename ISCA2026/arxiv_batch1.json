@@ -1,0 +1,29 @@
+{
+  "found": 3,
+  "papers": [
+    {
+      "id": "2306.16391v2",
+      "title": "Uncovering Software-Based Power Side-Channel Attacks on Apple M1/M2 Systems",
+      "abstract": "Traditionally, power side-channel analysis requires physical access to the target device, as well as specialized devices to measure the power consumption with enough precision. Recently research has shown that on x86 platforms, on-chip power meter capabilities exposed to a software interface might be used for power side-channel attacks without physical access. In this paper, we show that such software-based power side-channel attack is also applicable on Apple silicon (e.g., M1/M2 platforms), exploiting the System Management Controller (SMC) and its power-related keys, which provides access to the on-chip power meters through a software interface to user space software. We observed data-dependent power consumption reporting from such SMC keys and analyzed the correlations between the power consumption and the processed data. Our work also demonstrated how an unprivileged user mode application successfully recovers bytes from an AES encryption key from a cryptographic service supported by a kernel mode driver in MacOS. We have also studied the feasibility of performing frequency throttling side-channel attack on Apple silicon. Furthermore, we discuss the impact of software-based power side-channels in the industry, possible countermeasures, and the overall implications of software interfaces for modern on-chip power management systems.",
+      "score": 0.333,
+      "cat": "Security",
+      "sess": "3C"
+    },
+    {
+      "id": "2103.14244v1",
+      "title": "A Survey of Microarchitectural Side-channel Vulnerabilities, Attacks and Defenses in Cryptography",
+      "abstract": "Side-channel attacks have become a severe threat to the confidentiality of computer applications and systems. One popular type of such attacks is the microarchitectural attack, where the adversary exploits the hardware features to break the protection enforced by the operating system and steal the secrets from the program. In this paper, we systematize microarchitectural side channels with a focus on attacks and defenses in cryptographic applications. We make three contributions. (1) We survey past research literature to categorize microarchitectural side-channel attacks. Since these are hardware attacks targeting software, we summarize the vulnerable implementations in software, as well as flawed designs in hardware. (2) We identify common strategies to mitigate microarchitectural attacks, from the application, OS and hardware levels. (3) We conduct a large-scale evaluation on popular cryptographic applications in the real world, and analyze the severity, practicality and impact of side-channel vulnerabilities. This survey is expected to inspire side-channel research community to discover new attacks, and more importantly, propose new defense solutions against them.",
+      "score": 0.214,
+      "cat": "Security",
+      "sess": "3C"
+    },
+    {
+      "id": "2505.16501v1",
+      "title": "Performance of Confidential Computing GPUs",
+      "abstract": "This work examines latency, throughput, and other metrics when performing inference on confidential GPUs. We explore different traffic patterns and scheduling strategies using a single Virtual Machine with one NVIDIA H100 GPU, to perform relaxed batch inferences on multiple Large Language Models (LLMs), operating under the constraint of swapping models in and out of memory, which necessitates efficient control. The experiments simulate diverse real-world scenarios by varying parameters such as traffic load, traffic distribution patterns, scheduling strategies, and Service Level Agreement (SLA) requirements. The findings provide insights into the differences between confidential and non-confidential settings when performing inference in scenarios requiring active model swapping. Results indicate that in No-CC mode, relaxed batch inference with model swapping latency is 20-30% lower than in confidential mode. Additionally, SLA attainment is 15-20% higher in No-CC settings. Throughput in No-CC scenarios surpasses that of confidential mode by 45-70%, and GPU utilization is approximately 50% higher in No-CC environments. Overall, performance in the confidential setting is inferior to that in the No-CC scenario, primarily due to the additional encryption and decryption overhead required for loading models onto the GPU in confidential environments.",
+      "score": 0.375,
+      "cat": "Security",
+      "sess": "3C"
+    }
+  ]
+}
