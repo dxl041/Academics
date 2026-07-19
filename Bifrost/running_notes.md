@@ -7,7 +7,7 @@
 ### 基本信息
 - **标题**: Bifrost: Alibaba's Next-Generation VPC Network with High-Performance Multipath Reliable Transport
 - **会议**: NSDI'26
-- **作者**: 江波（上海交通大学）+ 朱顺民（阿里云），共28人（阿里云25人+3校联合培养）
+- **作者**: 江波（上海交通大学）+ 祝顺民（阿里云），共28人（阿里云25人+3校联合培养）
 
 ### 一句话标题
 Bifrost：阿里云在SmartNIC上实现多路径可靠传输解决VPC网络不稳定导致的尾延迟恶化
