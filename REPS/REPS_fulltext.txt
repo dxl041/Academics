@@ -1,0 +1,2346 @@
+=== PAGE 1 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation
+Tommaso Bonato
+ETH Zürich
+MicrosoftAbdul Kabbani
+MicrosoftAhmad Ghalayini
+MicrosoftMichael
+Papamichael∗
+MicrosoftMohammad
+Dohadwala∗
+Microsoft
+Lukas Gianinazzi
+ETH ZürichMikhail Khalilov
+ETH ZürichElias Achermann
+ETH ZürichDaniele De Sensi
+Sapienza University
+of RomeTorsten Hoefler
+ETH Zürich
+Microsoft
+Abstract
+Next-generation datacenters require highly efficient network
+load balancing to manage the growing scale of artificial intel-
+ligence (AI) training and general datacenter traffic. However,
+existing Ethernet-based solutions, such as Equal Cost Multi-
+Path (ECMP) and oblivious packet spraying (OPS), struggle
+to maintain high network utilization due to both increasing
+traffic demands and the expanding scale of datacenter topolo-
+gies, which also exacerbate network failures. To address
+these limitations, we propose REPS, a lightweight decentral-
+ized per-packet adaptive load balancing algorithm designed
+to optimize network utilization while ensuring rapid recov-
+ery from link failures. REPS adapts to network conditions by
+caching good-performing paths. In case of a network failure,
+REPS re-routes traffic away from it in less than 100 microsec-
+onds. REPS is designed to be deployed with next-generation
+out-of-order transports, such as Ultra Ethernet, and uses
+less than 25 bytes of per-connection state regardless of the
+topology size. We extensively evaluate REPS in large-scale
+simulations and FPGA-based NICs.
+CCS Concepts:•Networks →Data center networks;
+Traffic engineering algorithms.
+Keywords:load balancing; packet spraying; out-of-order
+transport; RDMA; Ultra Ethernet
+ACM Reference Format:
+Tommaso Bonato, Abdul Kabbani, Ahmad Ghalayini, Michael Pa-
+pamichael, Mohammad Dohadwala, Lukas Gianinazzi, Mikhail
+Khalilov, Elias Achermann, Daniele De Sensi, and Torsten Hoe-
+fler. 2026. REPS: Recycled Entropy Packet Spraying for Adaptive
+∗Work done while at Microsoft; the author has since left the company.
+This work is licensed under a Creative Commons Attribution 4.0 Interna-
+tional License.
+EUROSYS ’26, Edinburgh, Scotland Uk
+©2026 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-2212-7/26/04
+https://doi.org/10.1145/3767295.3769320Load Balancing and Failure Mitigation. In21st European Confer-
+ence on Computer Systems (EUROSYS ’26), April 27–30, 2026, Ed-
+inburgh, Scotland Uk.ACM, New York, NY, USA, 22 pages.https:
+//doi.org/10.1145/3767295.3769320
+1 Introduction
+Modern AI training cluster networks draw on both high-
+performance computing (HPC) and cloud-native architec-
+tures [ 25,32,54]. These systems rely on Remote Direct Mem-
+ory Access (RDMA) for low-latency, high-throughput com-
+munication. InfiniBand, a specialized RDMA transport, is
+widely used for its performance [ 1]. More recently, opera-
+tors have adopted commodity Ethernet fabrics, especially
+RoCEv2 [ 8], which enable RDMA over standard hardware
+using off-the-shelf switches and NICs to reduce costs. How-
+ever, as training clusters scale from around 10,000 endpoints
+(enough to train GPT-4 or Llama 3–scale models [ 2,22]) to
+over 100,000 nodes, both interconnects face fundamental
+limits in sustaining peak bandwidth due to:
+1.increased traffic volume and burstiness in collective
+communication compared to traditional workloads [ 42,
+71],
+2.the complexity and overhead of managing a lossless,
+in-order network at scale, especially under link failures
+and performance degradation. [25].
+Thus, the community recognized the need for network
+stacks tailored to distributed training traffic while remaining
+compatible with commodity datacenter Ethernet infrastruc-
+ture [25]. Such proposals include SRD by Amazon [58], Fal-
+con by Google [ 62], TTPoE by Tesla [ 46], and Ultra Ethernet
+(UE) [ 18], developed in collaboration between major tech
+players. Key open questions in these proposals are how to
+addressload balancingandmitigate link failures.
+Current-generation in-order Ethernet-based training sys-
+tems (such as RoCEv2-based clusters) typically rely on ECMP
+[35] or similar mechanisms for decentralized routing and
+load balancing. ECMP load balancing logic applies a hashing
+function to the 5-tuple header of each data packet to deter-
+mine the next hop to take. The benefit of this scheme is that,
+ignoring link failures, it is unlikely to receive out-of-order
+packets at the destination NIC as packets belonging to thearXiv:2407.21625v6  [cs.NI]  10 Feb 2026
+=== PAGE 2 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+same connection will be routed through the same network
+path.
+However, ECMP routing is fragile when different connec-
+tions get hashed to the same link [ 4,5,25]. In this scenario,
+flows can get hashed to the same path even when other paths
+are free, resulting in congestion and queue build up, which, in
+turn, can result in drops and go-back-N retransmissions [ 33].
+Moreover, recent works have shown that link failures
+drastically impact both training times and economic costs. A
+single link failure can have ≈20×higher cost impact in dis-
+tributed training workloads than in cloud workloads [ 25,54].
+This observation, along with the increasing scale these sys-
+tems are growing at, highlights the need for a transport layer
+with a load balancing scheme that can adapt near-instantly,
+e.g., within a few round-trip times (RTTs), to network fail-
+ures and, consequently, bandwidth asymmetries across the
+topology.
+Several solutions have been proposed to overcome ECMP’s
+limitations. MPTCP [ 57], PLB [ 55], FlowBender [ 38], Flowlet
+Switching [ 65], and Flowcell [ 30] divide flows into subflows
+or flowlets and then route each one individually. However,
+these solutions are still designed for in-order networks, mak-
+ing them inherently sensitive to collisions, prone to handling
+failures poorly, and requiring significant memory for each
+connection [ 45]. Load balancers, such as Oblivious Packet
+Spraying (OPS) [ 20] and Multi-Path RDMA (MPRDMA) [ 45],
+that operate at a per-packet granularity, can mitigate ECMP-
+based collisions. However, both approaches lack mechanisms
+to load balance effectively in the presence of network fail-
+ures. Additionally, MPRDMA is constrained by its limited
+support for receiving out-of-order (OOO) packets and its
+requirement for per-packet acknowledgments (ACKs).
+Our key insight is that the challenges of spraying-based
+load balancing can be addressed byadaptivepacket spray-
+ing, paired with a transport layer that natively supports
+out-of-orderpacket delivery, as demonstrated in SRD [ 58],
+UE [ 34,45], Falcon [ 62] and recent research work [ 20,25,
+50]. Based on this insight, we design and contribute to the
+Ultra Ethernet Consortium (UEC) our decentralized load-
+balancing scheme, Recycled Entropy Packet Spraying aka
+REPS. REPS caches "good" network paths in a circular buffer
+and quickly recovers (within a few RTTs) from network fail-
+ures by adaptively discovering or freezing network paths.
+Figure 1 provides a schematic overview of REPS. The 1.0
+Ultra Ethernet specification explicitly cites REPS as a refer-
+ence load-balancing mechanism for Ultra Ethernet Transport
+(UET) [64].
+REPS does not require any special hardware support from
+switches beyond ECMP-based header hashing and ECN,
+which are standard features in modern switches [ 33,49].
+REPS requires only ≈25bytes of state per-connection re-
+gardless of the topology size, whereas MPTCP requires 368
+extra bytes for 8 sub-flows [45].
+5Buffer has valid
+elem. → Load EV: 55SenderData Pkt
+ACK Pkt
+EV: 55Receiver1Buffer empty → 
+Random EV : 18
+3ACK with ECN
+mark → Discard EV
+4ACK no ECN
+mark → Save EV8Buffer has valid 
+elem. → Load EV: 11
+REPS Buffer
+Freezing Mode: Off
+Valid Elements: 02Buffer empty → 
+Random EV: 14
+EV: 55 EV: 11EV: 11
+EV: 18
+EV: 4 EV: 99EV: 14
+7ACK no ECN
+mark → Save EV6ACK with ECN
+mark → Discard EV
+Timestamp
+Congested Path
+Uncongested pathEV 
+55
+EV 
+11
+9Figure 1.Schematic of REPS. We do not show elements
+invalidation (for EV 55 and 11) in the circular buffer after
+usage.
+We extensively evaluate REPS in simulation and augment
+the simulation findings with real hardware results in Sec-
+tion 4. We deploy REPS in a cluster with modified FPGA-
+based RDMA-capable NICs. In large-scale network simula-
+tions, REPS consistently outperforms state-of-the-art load
+balancing algorithms. REPS outperforms ECMP and OPS by
+up to6×and1.25×in symmetric networks, and by up to5 ×
+and2×in asymmetric networks, outperforming OPS by as
+much as100×during short-term transient link failures.
+2 REPS Building Blocks
+In this section, we introduce the fundamental building blocks
+necessary to understand REPS logic. We first describe key
+congestion signals, such as ECN [ 24] and packet loss. We
+then introduce essential terms and concepts related to load
+balancing, including ECMP and EV. These concepts are largely
+established, but we revisit them here to provide clear termi-
+nology and a basis for the discussion that follows.
+2.1 Congestion Signals
+Explicit Congestion Notification (ECN) marking allows
+switches to notify congestion by setting a bit in the traffic
+class field of the IP header. The receiver then sends back
+this marked ECN bit to the sender in its ACK packet header.
+The sender can choose to react to this congestion signal by
+adjusting its sending rate [ 6,67,73]. Switches can employ
+various strategies for marking packets. For instance, inRan-
+dom Early Detection(RED) [ 23], switches probabilistically
+mark packets based on queue size, with the marking proba-
+bility increasing linearly between two thresholds ( 𝐾𝑚𝑖𝑛and
+𝐾𝑚𝑎𝑥).
+In REPS, we use ECN as the congestion signal to detect path
+congestion due to its simplicity and widespread adoption [ 33,
+49]. Since ECN is not marked for packets when the queue is
+smaller than 𝐾𝑚𝑖𝑛, ECN effectively filters out cases of minor
+queuing due to packet collisions across multiple hops, while
+identifying true congestion at a single bottleneck. In contrast,
+=== PAGE 3 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+delay-based signals struggle to differentiate between these
+scenarios unless enhanced by advanced switch features, such
+as in-network telemetry (INT) [66].
+Packet loss has long been a key indicator of severe con-
+gestion in networks [ 23,48]. However, using packet losses
+as the sole signal for congestion detection can result in de-
+layed responses, as losses typically indicate a point of sig-
+nificant congestion. Packet loss detection, often based on
+timeouts, can be challenging to calibrate and may lead to
+unnecessary retransmissions. We categorize packet losses
+in two categories: losses because of congestion and losses
+due to networking failures. To differentiate the two types
+of losses and to improve reaction times, packet trimming,
+which only triggers for congestion drops, can be employed
+[3,15,28,43,51]. Trimming can be implemented on many
+existing switches [ 3] and is starting to be supported by some
+switch vendors. It is also being pushed as a UE protocol
+feature [ 17]. On current generation networks, REPS can be
+deployed with timeouts, and in next-generation augmented
+with trimming to distinguish between loss types (more de-
+tails in Appendix A).
+Congestion Control (CC) algorithms rely on congestion
+signals, such as ECN marks or packet loss, to adjust a flow’s
+sending rate or window with the goal of maintaining high
+network utilization while preventing queue build up. REPS
+is designed to work well with any CC algorithm as long as
+they support receiving and acknowledging packets out-of-
+order for a given message. In particular, we show later how
+REPS works well with EQDS, a variant of DCTCP, and a
+proprietary internal CC algorithm [6, 51].
+2.2 Load Balancing
+Equal Cost Multi-Path (ECMP) is one of the most com-
+monly used and simple load balancing mechanisms. It works
+by using a hashing function to randomly choose one of the
+available paths for a given packet [ 35]. The hashing func-
+tion usually takes as input 5 elements (akafive tuple) from
+the packet header: the protocol number, source address, des-
+tination address, source port, and destination port (some
+variations utilize only the four tuple without the protocol
+number). Recent approaches have proposed incorporating
+additional fields, such as the Time-to-Live (TTL) or the Flow
+Label (in IPv6), to further refine the hash calculation [ 38,55].
+Under normal circumstances, all packets belonging to the
+same flow are assigned statically to a given path since the
+hashing function will use the same values as input. This
+assignment is done statically and ignores the current net-
+work congestion and failure conditions. As a result, two or
+more flows might be assigned to the same path even if there
+are many more paths available. This will inevitably result
+in heavy congestion and, possibly, packet drops as a conse-
+quence. Such ECMPhash collisionsare a well-documented
+limitation of standard ECMP [5, 25, 70].Entropy Value (EV) is a value in the packet header that
+can be configured to be an input to the ECMP hashing func-
+tion in switches. This value, which is set by the sender, helps
+to determine a packet’s path through the network. Possible
+header fields to be used as an EV are the Source Port field in
+the packet header [ 45] or the Flow Label field in IPv6 [ 55].
+This is consistent with previous load balancing works and has
+already been demonstrated in practice [ 38,45,55,65]. REPS
+leverages entropy values (EVs) to improve load balancing
+and mitigate ECMP collision limitations, without requiring
+knowledge of the exact mapping from a packet’s EV to its
+resulting path. Switch hash functions can produce collisions:
+packets with distinct EVs, with all other header fields held
+constant (e.g., source and destination IPs), may still traverse
+the same physical path. The sender, including REPS, can-
+not directly infer whether changing the EV will change the
+path. Nevertheless, with a well-designed hash function, the
+induced path distribution should closely approximate a uni-
+form random assignment, yielding near-optimal spreading.
+Entropy Values Set (EVS) is a fixed-size set of EVs, since
+the number of possible values is constrained by the number
+of bits they can occupy in the packet header. For example,
+the source port field in a UDP header is assigned 16 bits,
+giving the EVS a size of 65536 possible values (excluding
+some reserved values) [ 45]. While different numbers of bits
+could be allocated for the EVS, we analyze in Section 4.5.2
+how many are required for optimal performance. It is gen-
+erally advantageous for an algorithm to achieve good load
+balancing performance with asmallEVS size since that of-
+ten reduces the algorithm’s memory overhead. Note that
+the minimum effective EVS size also depends on the net-
+work topology: smaller topologies require fewer EVs to fully
+explore all available physical paths.
+Oblivious Packet Spraying (OPS), also known as Random
+Packet Spraying (RPS) [ 20], randomly distributes individual
+packets across all available paths between a sender and a
+receiver. This is done by selecting a random EV for every
+packet at the sending host or by choosing a random output
+port at the switches. OPS has the advantage of distributing
+traffic evenly across multiple paths, addressing most ECMP
+issues. However, it is unaware of asymmetries or failures
+and can still be sub-optimal even in a perfectly symmetrical
+network (Section 4.3.1).
+3 REPS
+Recycled Entropy Packet Spraying akaREPSis a load bal-
+ancing algorithm that relies on simple and memory-efficient
+endpoint logic. The key idea behind REPS is straightforward:
+when congestion is detected on a certain path, we explore
+alternative paths while caching and reusing paths with little
+to no congestion. Specifically, REPS uses a circular buffer of
+a fixed size to cache EVs of uncongested paths. By design,
+=== PAGE 4 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+REPS can be implemented in NIC hardware or firmware with
+minimal memory/area footprint. REPS does not need any
+switch support besides ECMP hashing and ECN marking.
+Placing REPS at the endpoint not only simplifies deployment
+but also provides a broader, end-to-end view of the network,
+unlike fabric-side approaches which are limited to local vis-
+ibility. Algorithm 1 details pseudocode for a REPS sender
+receiving an ACK and detecting a failure. Algorithm 2 de-
+scribes pseudocode for a REPS sender sending a data packet.
+3.1 Core Logic: Path Exploration and Reuse
+During the first Bandwidth-Delay Product (BDP) worth of
+packets of a new or idle connection, a REPS senderexplores
+random entropies from the EVS. This exploration is neces-
+sary because, initially, there is no fresh knowledge about
+the network’s state. In this warm up phase, REPS operates
+similarly to OPS.
+Upon receiving a data packet, the receiver copies the EV
+from the received packet into the acknowledgement (ACK)
+packet, forwarding it back to the sender. More specifically,
+ACKs can use that same EV for their own header instead
+of using a new header field, eliminating the need for extra
+header space and for any changes to the packet wire format.
+When an ACK arrives at the sender, if it is not ECN-
+marked, the EV it carries is cached in the circular buffer,
+and its validity bit is set to 1. Otherwise, if the ACK is ECN-
+marked, REPS does not cache the EV and discards it. When
+set, the validity bit indicates that an entropy has not been
+used after it has been added to the circular buffer. When
+sending a data packet out, REPS first checks if there are any
+valid EVs in its buffer. In case there is any valid EV, REPS
+reusesthe oldest valid EV from the circular buffer and resets
+its validity bit. Otherwise, REPSexploresa random EV from
+the EVS.
+The circular buffer in REPS ensures that bursts of back-to-
+back ACKs with "good" entropies are correctly cached and
+reused. Moreover, it guarantees stable load balancing in the
+case of failures as shown in Section 3.2. We use a circular
+buffer of 8 elements based on empirical evidence and the
+bounds derived from Theorem 5.1.
+3.2 Failure Mitigation: Freezing Mode
+When a network, running without REPS, experiences any
+kind of transient (e.g., link flap) or persistent unrecoverable
+failure (e.g., a link or switch failure), it will take the system
+some time to recover from it: ranging from several millisec-
+onds to update the ECMP routing group to several seconds
+if a reboot is needed, and more if a swap is needed [7, 37].
+If we assume that it takes10ms to exclude a failed cable
+from a routing group, packets will still be routed to this fail-
+ing group during this transient period, resulting in packet
+drops. Specifically, with a 4 KiB MTU and a 400 Gbps link,
+this could potentially result in over 120,000 packets (approxi-
+mately 0.5 GB) being lost (ignoring congestion control). Thisbecomes even more critical in the case of other failures where
+it takes longer to update the routing.
+By default, REPSCore Logicwould already limit utilizing
+failing paths since it would only recycle paths that are still
+active and returning ACKs without ECN. However, if the
+REPS buffer was empty, it would select a random EV that
+could potentially map to a failing path. To further improve
+the performance of REPS and prevent further losses, we intro-
+ducefreezing mode. REPS enters this mode when detecting
+failures via indirect feedback from the network. REPS uses
+a timeout heuristic (Section 2.1) that can be enhanced with
+packet trimming (Appendix A) as a natural feedback from
+the network to detect failures along a path.
+When infreezing mode, REPS:
+1.avoids exploring new EVs at random since this could
+result in the hashing function picking a failing path,
+2.reuses the elements that are currently in the circular
+buffer even if they might be invalid.
+While this strategy could result in slightly worse load
+balancing (due to potentially reusing the same EV several
+times), it comes with the major benefit of guaranteeing that
+REPS will almost never pick the failing path again since the
+recent received EVs point to healthy paths. Considering the
+example above: by enabling freezing mode, the number of
+drops decreases from over 120K packets to only about 1K.
+To decide when to exit freezing mode, we either send probe
+packets to check the status of the failing paths or, if probing
+is not available, we simply exit freezing mode after a fixed
+amount of time. Once we exit freezing mode, we occasionally
+use random EVs to allow REPS to explore new paths and
+assess whether we detect new packets failing or not. This
+prevents REPS from getting stuck in a suboptimal state if
+the EVs in the buffer were all pointing to a failing path, a
+rare scenario that can theoretically happen with properly
+timed back-to-back network failures. Moreover, if REPS exits
+freezing mode before the issue is fully resolved, it will simply
+re-enter the mode shortly afterward with minimal impact on
+performance and a very small impact on extra packet drops
+(as we will show in Section 4.3.3).
+The intuition behind freezing mode is that once we sus-
+pect there is a failure, we want to start avoiding it as soon
+as possible. Interestingly, we observe that even if we enter
+freezing mode unnecessarily (i.e., by mistaking a congestion
+drop for a network failure), REPS would still load balance
+well, as discussed in Section 4.5.2 and Appendix A. This ob-
+servation means that even if there is doubt about whether
+a real failure occurred, REPS can be conservative and can
+safely enter freezing mode. Finally, we note that freezing
+mode is not crucial to the inner working of REPS, as it can
+work also without it. It merely adds more guarantees on
+top of it and improves performance in some failure cases.
+We showcase the impact of running REPS without freezing
+mode in Appendix C.4.
+=== PAGE 5 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+Algorithm 1REPS logic upon ACK receive and failure detection.
+1:repsBuffer=[]⊲State variables.
+2:isFreezingMode=𝑓 𝑎𝑙𝑠𝑒
+3:head,numberOfValidEVs,exploreCounter=0
+4:
+5:procedureonAck(ackPacket)⊲Sec. 3.1
+6:ifackPacket.ecn is setthen
+7:return
+8:end if
+9:ifnot repsBuffer[head].isValidthen
+10:numberOfValidEVs++
+11:end if
+12:repsBuffer[head].cachedEV=ackPacket.ev
+13:repsBuffer[head].isValid=true
+14:head=(head+1)%REPS_BUFFER_SIZE
+15:ifisFreezingModeandnow()>exitFreezingModethen⊲Sec. 3.2
+16:isFreezingMode=false
+17:exploreCounter=NUM_PKTS_CWND
+18:end if
+19:end procedure
+20:
+21:procedureonFailureDetection()⊲Sec. 3.2
+22:ifnot isFreezingModeandexploreCounter== 0then
+23:isFreezingMode=true
+24:exitFreezingMode=now()+FREEZING_TIMEOUT
+25:end if
+26:end procedure
+Algorithm 2REPS logic on send datapath.
+1:⊲Variables already listed in Algorithm 1
+2:proceduregetNextEV()
+3:ifnumberOfValidEVs>0then
+4:offset=(head−numberOfValidEVs)%REPS_BUFFER_SIZE
+5:repsBuffer[offset].isValid=false
+6:numberOfValidEVs=numberOfValidEVs−1
+7:else⊲Must be in freezing mode.
+8:offset=head
+9:head=(head+1)%REPS_BUFFER_SIZE
+10:end if
+11:returnrepsBuffer[offset].cachedEV
+12:end procedure
+13:
+14:procedureonSend(dataPacket)
+15:ifexploreCounter>0then
+16:if(−−exploreCounter%REPS_BUFFER_SIZE)==0then
+17:𝑑𝑎𝑡𝑎𝑃𝑎𝑐𝑘𝑒𝑡.𝑒𝑣=rand()modEVS_SIZE
+18:end if
+19: else ifrepsBuffer.isEmpty()or numberOfValidEVs== 0andnot
+isFreezingModethen
+20:dataPacket.ev=rand()%EVS_SIZE
+21:else
+22:dataPacket.ev=getNextEV()
+23:end if
+24:end procedure
+3.3 REPS Design Advantages
+Simple and versatile algorithm: The simplicity of REPS
+enables cost-efficient hardware support, as it does not re-
+quire any change of the packet headers format or existing
+network components. Moreover, its code is short and easy to
+implement and understand. REPS works best with per-packetACKs, but we show in Section 4.5.1 that it still performs well
+even with ACK coalescing. While we focus on fat tree topolo-
+gies in this paper, we believe REPS could work well even
+with different topologies [ 31,39] with little to no adjust-
+ments required. Moreover, we expect REPS to work well
+even when using source-based routing algorithms where the
+NIC chooses directly the paths to use instead of relying on
+ECMP-hashing in switches. In this case, REPS would store
+the actual path ID for its EVs.
+Minimal NIC memory footprint: A key advantage of REPS
+is that it does not need to track per-EV metrics and statistics.
+As will be discussed in Section 4.5.2, achieving good perfor-
+mance with OPS requires a relatively large EVS. If OPS were
+to maintain metrics for each EV, the memory overhead would
+be excessive for a hardware NIC implementation, e.g., 64 Kib
+to store 1 bit per entropy value for an EVS with 64K EVs.
+However, REPS only needs a fixed number of bytes in mem-
+ory. More specifically, as detailed in Table 1, REPS requires
+only around≈25bytes. Moreover, even when constrained to
+a small EVS, REPS is still able to perform well (Section 4.5.2),
+which can further reduce REPS’ memory footprint by 1 byte
+since Table 1 assumed 16 bits per EV.
+There is a subtle observation as to why REPS can achieve
+a great performance without needing a lot of state: while
+the REPS buffer is used to cache good entropies, it is really
+only useful in certain scenarios like when receiving a burst of
+ACKs or during freezing mode. In reality, most of REPS’ state
+is on the wire, stored in the inflight data and ACK packets,
+which will inform REPS about the good paths in the network.
+Component Footprint (bits)
+Circular Buffer Element (×elements in buffer):
+Entropy Value (cachedEV) 16
+Entropy Validity Bit (isValid) 1
+Global Variables:
+Head Buffer (head) 8
+Number Valid Entropies (numberOfValidEVs) 8
+Exit Freezing Time (exitFreezingMode) 32
+Is Freezing Mode (isFreezingMode) 1
+Explore Counter (exploreCounter) 8
+Total (1 element in buffer) 74≈10 bytes
+Total (8 elements in buffer) 193≈25 bytes
+Table 1.Per-connection memory footprint of REPS.
+Quick failure mitigation: The general approach of REPS
+is that it only keeps track of good paths and avoids keeping
+statistics on congested or failing paths. This approach en-
+ables it to promptly load balance away from a congested link
+or failing link as, especially for the latter, it is never going
+to take a random guess once a link is failing. Any alterna-
+tive method that tries to avoid selecting a failing path by
+tracking bad EVs would need to keep records of all the EVs
+that map to that path for a given flow, which would involve
+tracking not only the failing EVs but also all those still in
+flight, resulting in excessive NIC’s memory usage.
+=== PAGE 6 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+4 Evaluation
+Our evaluation includes both large-scale simulations de-
+signed to stress test REPS under a variety of workloads, and
+experiments on real hardware at meaningful scale. The goal
+is to answer the following research questions:
+•Does REPS outperform state-of-the-art load balancers
+in a healthy network with a symmetric topology? (Sec-
+tions 4.3.1 and 4.4.1)
+•How does REPS perform in the presence of topology
+asymmetries or when coexisting with non-REPS traf-
+fic? (Sections 4.3.2 and 4.4.2)
+•Can REPS recover quickly from failures? Is it resilient
+to severe or widespread failures? (Sections 4.3.3 and
+4.4.3)
+•Does REPS maintain performance under varying net-
+work parameters and configurations? (Section 4.5)
+4.1 Evaluation Setup
+Baseline load balancers: In large-scale simulations, we com-
+pare REPS with ECMP [ 35], OPS [ 20], PLB [ 55], MPRDMA
+[45], Flowlet Switching [ 65], an MPTCP-like algorithm [ 57],
+a bitmap approach where we keep per EV statistics simi-
+larly to STrack [ 40], and adaptive RoCE by NVIDIA [ 50]. We
+note that this list includes both sender-based approaches
+and in-network switch-based approaches. We configure PLB
+to have more aggressive parameters similarly to FlowBen-
+der to improve its performance [ 38]. For Flowlet Switching
+we set an aggressive flowlet timeout at half of the RTT. For
+MPTCP, we divide each message into 8 subflows and route
+each one individually similarly to using multiple QPs (Queue
+Pairs) [25].
+NIC congestion control: In all simulated baseline runs, we
+use the same DCTCP [ 6] variant used in MPRDMA [ 45]. It
+applies per-ACK congestion window updates, allows the
+receiver to accept and acknowledge out-of-order packets,
+and reduces the congestion window by one MTU in case
+of packet drops. In the FPGA-based experimentation, we
+use a similar but proprietary CC algorithm that relies on
+ECN marking, congestion notification packets, and per-flow
+congestion window adjustments.
+Network setup: Regardless of the workloads that we dis-
+cuss in Section 4.2, in the evaluation we simulate 3 different
+scenarios: (1) healthy symmetric network conditions, (2)
+asymmetric network conditions, which can be due to asym-
+metric path bandwidth or due to ECMP-hashed background
+traffic that increase load on specific paths (a scenario that
+can happen in incremental deployments of REPS), and (3) a
+network encountering various failure modes. We focus on
+the most relevant failure scenarios for real-world deploy-
+ments [ 25] and we report the remaining ones in Appendix C.
+Simulation model: We implement REPS by extending the
+htsimpacket-level network simulator [ 28]. Our simulations
+consider different fat-tree topologies with 1024 nodes and 128nodes and with different levels of oversubscription ranging
+from 1:1 (no oversubscription) to 4:1. We test 2- and 3-tier fat
+trees (TOR or Top-of-rack asT0, Aggregate asT1and Core
+T2). Such topologies are commonly deployed in production
+datacenters designed for distributed training [ 25,59]. We
+use the larger topologies for the microbenchmark runs while
+the smaller topology for running the datacenter traces and
+AI collectives.
+We reflect the specifications of current-generation switches
+in simulation parameters: a 4 KiB MTU size, a bandwidth of
+400 Gbps, and a switch traversal latency of 500 ns [ 13,19].
+We assume uniform link lengths and latencies, with each
+link exhibiting a latency of 500 ns. We set the retransmission
+timeout (RTO) to70 𝜇swhich is the amount of time it takes
+to traverse every queue in the network if it was full plus the
+network-wide RTT. For each queue 𝐾𝑚𝑖𝑛is set to 20% of the
+queue size (one BDP) and𝐾 𝑚𝑎𝑥to 80% of it.
+REPS-FPGA: To demonstrate the effectiveness and resilience
+of entropy recycling in a real network environment, we also
+evaluate REPS in an end-to-end setting. We use a modified
+production-grade FPGA-based RDMA-capable NIC running
+a custom transport protocol capable of handling OOO pack-
+ets by directly placing the payload in memory via RDMA.
+The transport implementation relies on SACKs that carry
+bitmaps (256-bit-wide in these experiments) relaying packet
+delivery updates to track completions and handle selective
+retransmissions. Each connection maintains an 8-entry-deep
+REPS buffer that stores UDP source ports (2B). Our experi-
+mental setup is configured to support up to 256 connections
+for a total memory footprint of 4KB. Given that only a single
+connection is active at a time, all REPS buffers can be hosted
+in a single SRAM memory and the associated logic to man-
+age REPS buffers can be multiplexed across all connections,
+occupying negligible resources (<0.04% of the total device
+logic resources).
+The testbed consists of a two-tier fat-tree Ethernet network
+with 100G NICs and 12.8T switches. The default MTU for
+our FPGA NICs is 8KB and typical RTT incorporating NIC
+buffer delay and ACK processing through T0 and T1 are in
+the order of 10 and 15 us, respectively.
+4.2 Workloads
+We evaluate REPS on a mix of synthetic benchmarks, real
+datacenter traces, and distributed training collectives.
+Synthetic benchmarks set consists of (1)incast, (2)per-
+mutation, and (3)tornadotraffic patterns. Incast happens
+when multiple senders simultaneously send to one receiver.
+It is very common in storage workloads [ 14,69] but also,
+with a small incast degree, in distributed training [ 25]. In the
+permutation pattern, each node sends to a random receiver,
+and we ensure that each node is sending and receiving to
+exactly one node [ 6]. The tornado pattern is a special case of
+the permutation where each node sends to its "twin" node in
+=== PAGE 7 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+the other half of the tree. For example, with 128 nodes, node
+0 would send to 64 and vice-versa, node 1 to 65 and so on.
+Tornado is an important worst case for load balancing, as
+each packet is required to traverse the full tree [53].
+Datacenter traces: We use real datacenter traces from sim-
+ilar previous work [ 6,68]. We use a series of traces used for
+web search in production clusters. In such distribution the
+majority of flows are quite small (less than 100 KB) while
+a small number of flows are large. For each node we select
+randomly the receiver. More details are available in Appen-
+dix D.
+AI collectives: We show simulated results for two com-
+monly used collectives in AI training: the Allreduce imple-
+mented via the ring and butterfly algorithm [ 42], the Alltoall
+implemented using an algorithm where we limit the number
+of parallel connections per node (𝑛connections) [31, 47].
+Our baseline traffic for REPS-FPGA consists of 128 endpoints
+under two T0 switches continuously performing 4 MB ring-
+based AllReduce collective operations, with the logical ring
+laid out such that all connections traverse the T1 spine to
+maximize the pressure on the spine of the topology.
+4.3 Simulation Results
+We conduct a detailed analysis of REPS behavior for each
+network condition (see Section 4). We first examine a specific
+case in depth and then summarize key takeaways.
+4.3.1 Healthy Symmetric Network Conditions.In this
+Section we evaluate the performance of REPS in a simple
+setting where there is no oversubscription and there are
+no failures, meaning the network is perfectly symmetrical.
+Intuitively, this seems the best situation for oblivious packet
+spraying since evenly splitting the packets across multiple
+links should result in the best performance. However, as we
+will see later in this section and based on our theoretical
+model in Section 5, this is not the case as REPS still offers
+an up to 25% advantage over OPS. This is because of ECMP
+collisions that still happen with OPS. While over a long
+period of time, each link will be evenly used, there will still
+be short-term collisions happening that will increase and
+decrease the link utilization of certain links.
+Microscopic analysis: We study this effect in a tornado
+pattern, which, theoretically, can be managed entirely by
+optimal load balancing. We study what happens at a TOR
+switch and register the link utilization of the uplinks both
+over the entire simulation and also at smaller time buckets.
+For visualization purposes we limit these runs to a 2-tier
+network where each switch has 8 uplinks. However, we note
+that this problem is present, to an even bigger degree, when
+using a larger number of uplinks as explained in Section 5.
+In Figure 2 we visualize statistics for a single T0 switch
+during the workload run. In particular we show two key
+metrics over time: 1) on the left Y-axis we show theoutput
+port utilizationat fixed time intervals of 20 us. If it goes above
+0100200300
+01002003000 50 100 150 200 250 300 3500100200300400Oblivious Packet Spraying
+0 50 100 150 200 250 300 350
+Time (microseconds)0100200300400REPS
+Queue Size (KB)Output Port Utilization (Gbps)Ports Utilization (20/uni03BCs buckets)
+KMinKMin
+KMaxKMax
+QueuesFigure 2.A tornado workload with 16 MiB messages using
+OPS (top) and REPS (bottom) as load balancers.
+400 Gbps it means that during the studied time bucket some
+queueing was created. If it goes below it means the output
+port was slightly under-utilized. 2) On the right Y-axis we
+show thequeue sizeover time of the 8 output ports.
+In the case of OPS, we can see that due to the random na-
+ture of it, queues are created over time and that the link
+utilization of each port, at small timeframes, sometimes goes
+significantly above and below the optimal point (15% more
+or less). This shows that while OPS does still a decent job at
+completing the workload close to the ideal completion time,
+it does inevitably create unpredictable queues (potentially
+even exceeding 𝐾𝑚𝑎𝑥and causing drops) over short time pe-
+riods. Such queues will cause the CC to kick in and slightly
+reduce the sending rate and average output port utilization.
+In the same configuration with REPS, we notice a major
+difference in the bottom plot of Figure 2. In particular REPS
+converges quickly to a configuration where each queue is
+kept below 𝐾𝑚𝑖𝑛(note that the only guarantee here is that
+all queues will be below 𝐾𝑚𝑖𝑛, not necessarily all at the same
+value). At the same time, we can also notice that all the ports
+converge to the perfect selection rate of 400 Gbps. While the
+overall completion time is only about 4% better than OPS,
+the smaller queues provide a better guarantees for system
+low latency traffic. Moreover, as we can see in Figure 3, this
+gap expands as we increase the message size.
+Looking at the port selection rate over the entire run of the
+workload for OPS vs. REPS, we observe that they are nearly
+equivalent. This is, again, because the problem is with the
+short-term collisions that OPS can experience at microscopic
+scale.
+Macroscopic analysis: We now focus more on the overall
+view comparing REPS with all the other state of the art
+algorithms in a series of benchmarks.
+In Figure 3, we visualize a summary of the performance
+of the various algorithms by looking at the runtime of the
+workloads (max FCT). As expected, in the case of incast, the
+=== PAGE 8 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+1 2 3 4 5 6
+Speedup vs ECMPI. 8:1 4MiB
+I. 8:1 8MiB
+I. 8:1 16MiB
+P. 4MiB
+P. 8MiB
+P. 16MiB
+T. 4MiB
+T. 8MiB
+T. 16MiB
+40 50 60 70 80 90 100
+Load Level (%)0100200300400Average FCT (μs)
+AlltoAll
+(n=4)AlltoAll
+(n=8)AlltoAll
+(n=16)Ring
+AllRed.Butterfly
+AllRed.010203040Collective Runtime (ms)Synthetic Benchmarks DC Traces ML/AI Collectives
+ECMP OPS Flowlet BitMap MPRDMA PLB MPTCP Adaptive RoCE REPS
+Figure 3.REPS performance in synthetic benchmarks (I.=Incast, P.=Permutation, T.=Tornado), DC traces and AI collectives.
+0100200300400
+01002003004000 200 400 600 800 1000 1200 14000100200300400Oblivious Packet Spraying
+0 100 200 300 400 500 600 700 800
+Time (microseconds)0100200300400REPS
+Queue Size (KB)Output Port Utilization (Gbps)Queues
+QueuesPorts Utilization (20/uni03BCs buckets)Ports Utilization (20/uni03BCs buckets)
+KMinKMin
+KMaxKMax
+Figure 4.REPS vs. OPS in a 32 MiB message send with an
+asymmetric topology.
+performance is driven almost exclusively by the CC and,
+hence, we do not see any major difference between all the
+load balancers and even ECMP performs well. However, once
+we move to permutation and tornado workloads, ECMP col-
+lisions start to drastically reduce the performance of ECMP.
+In most cases REPS outperforms all the other algorithms.
+In the tornado case, Adaptive RoCE is able to match REPS
+since this is the ideal scenario for it: REPS, unlike Adaptive
+RoCE, still needs to guess during its initial BDP worth of
+packets. On the other hand, REPS outperforms Adaptive
+RoCE in the permutation pattern where taking a local opti-
+mal decision might not always lead to the best global out-
+come. We also see the difference between algorithms that
+were designed to reduce the number of out-of-order packets
+versus algorithms that do not have such hard constraints. Ad-
+ditionally, there is a distinction between algorithms that op-
+erate at packet-level granularity, such as REPS, OPS, BitMap,
+and MPRDMA, and those that operate at a coarser granular-
+ity, such as Flowlet and PLB.
+For datacenter traces, we analyze the results for different
+load levels, ranging from 40% to 100%. Here we observe again,
+the clear difference between per-packet algorithms and less
+granular options. Even at higher load REPS is able to work
+well with a 5% advantage over OPS.We also run distributed collectives and report their comple-
+tion times. We observe how, by design, the ring AllReduce
+has the same performance for most of the load balancing al-
+gorithms utilized. This is because, due to its ring design, there
+is no opportunity for congestion to accumulate. In AllToAll,
+REPS gets an up to 20% advantage over the alternatives.
+4.3.2 Asymmetric Network Conditions.We evaluate
+REPS under different scenarios where some degree of asym-
+metry is created. We focus on two scenarios: 1) the network
+is not perfectly symmetrical because of some missing (or
+degraded) cables, 2) there is some background traffic in the
+network that is using ECMP routing, analyzing the coexis-
+tence between REPS and non-REPS traffic.
+Microscopic analysis: We visualize this problem with a
+simple scenario where we have a switch with 𝑛input and
+output ports and 𝑛flows active, each from a different source
+sending a 32 MiB message. To create an asymmetry, we
+reduce one of the uplinks speed to 200 Gbps while all the
+other links remain at 400 Gbps. In Figure 4 we visualize the
+output port utilization rate for OPS and REPS.
+We observe that while OPS chooses each port equally, irre-
+spective of its actual bandwidth, REPS eventually converges
+to a stable configuration where the slower uplink is used
+less frequently. This results in both more stable queues but,
+more importantly, a much faster completion time (1400 𝜇s
+for OPS and799𝜇s for REPS).
+Macroscopic analysis: We now shift our focus to more
+general results when encountering asymmetries in a net-
+work. For space constraints, we focus mostly on the case
+where some of the links have a lower sending rate. In our
+first experiment we run synthetic benchmarks where3%of
+the TOR uplinks, chosen randomly, have been downgraded
+to 200 Gbps. In Figure 5, we can see results similar to be-
+fore where REPS gets an up to 500% advantage over ECMP
+and 10% advantage over the second best algorithm (usually
+BitMap). In the DC traces we can see a higher difference due
+to the asymmetry in the network. At 100% load REPS gets a
+25% advantage over the second best algorithm and a 1000%
+advantage over ECMP. We show the results for several AI
+collectives. We note how for AllToAll REPS keeps a small
+=== PAGE 9 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+AlltoAll
+(n=4)AlltoAll
+(n=8)AlltoAll
+(n=16)Ring
+AllRed.Butterfly
+AllRed.010203040Collective Runtime (ms)
+40 50 60 70 80 90 100
+Load Level (%)0100200300400Average FCT (μs)
+1 2 3 4 5
+Speedup vs ECMPI. 8:1 4MiB
+I. 8:1 8MiB
+I. 8:1 16MiB
+P. 4MiB
+P. 8MiB
+P. 16MiB
+T. 4MiB
+T. 8MiB
+T. 16MiBSynthetic Benchmarks DC Traces ML/AI Collectives
+ECMP OPS Flowlet BitMap MPRDMA PLB MPTCP Adaptive RoCE REPS
+Figure 5.REPS performance in synthetic benchmarks (I.=Incast, P.=Permutation, T.=Tornado), DC traces and AI collectives
+and an asymmetric network due to 3% of the TOR uplinks having downgraded bandwidth.
+1 2 3 4 5 6
+Speedup vs ECMPI. 8:1 4MiB
+I. 8:1 8MiB
+I. 8:1 16MiB
+P. 4MiB
+P. 8MiB
+P. 16MiB
+T. 4MiB
+T. 8MiB
+T. 16MiB
+0.751.001.251.501.752.002.252.50
+Speedup vs ECMPI. 8:1 4MiB
+I. 8:1 8MiB
+I. 8:1 16MiB
+P. 4MiB
+P. 8MiB
+P. 16MiB
+T. 4MiB
+T. 8MiB
+T. 16MiB
+ECMP OPS Flowlet BitMap MPRDMA PLB MPTCP Adaptive RoCE REPSMain Data Traﬃc Background Traﬃc
+Figure 6.Synthetic traffic with REPS and non-REPS (ECMP)
+traffic, emulating a mixed traffic scenario.
+but significant advantage and in the AllReduce a sizable 30%
+advantage over the second best performing algorithm.
+In Figure 6, we showcase one example of REPS sharing traffic
+together with background ECMP traffic (we assume 10% of
+the traffic is ECMP). In this case, REPS: 1) shifts REPS traffic
+away from ECMP traffic in order to not slow down REPS
+traffic, 2) helps background traffic by ensuring that it will
+not be slowed down by REPS traffic. This also highlights the
+possibility of incrementally deploying REPS on ECMP-based
+systems. Finally, we note that WCMP [ 72] could be used
+to enhance ECMP performance in the case of a topology
+with known asymmetries, but would not help as much in
+the case of unpredictable mixed traffic or sudden temporary
+asymmetries.
+4.3.3 Network Failures.We focus our attention to cases
+where the network encounters a failure during operation.
+We collect data from several previous works on networking
+failures and also study internal logs to simulate the most
+commonly reported cases [ 27,60,61]. Since the probability
+of a failure happening during a short simulation is low, we
+simulate worst case scenarios where we force individual
+failures to happen during the runtime of our simulations. In
+particular, we focus on total or partial failures of cables and
+switches. We note that we limit our failures to components
+that would not prevent the workload from completing (single
+point of failure).
+Microscopic analysis: We begin with a synthetic scenario
+in which two TOR-switch uplink failures occur at different
+0100200300
+01002003000 500 1000 1500 2000 25000100200300400Oblivious Packet Spraying
+0 250 500 750 1000 1250 1500 1750
+Time (microseconds)0100200300400REPS
+Queue Size (KB)Output Port Utilization (Gbps)KMinKMinKMax
+KMaxQueuesPorts
+Utilization
+Fail.1
+startsFail.1
+endsFail.2
+startsFail.2
+ends
+Freezing 
+startsFreezing stops 
+but restarts soon after Freezing 
+startsFreezing 
+stops
+Freezing 
+stopsCC drastically reduces
+sending rate even
+for good pathsFigure 7.REPS vs. OPS in a 64 MiB permutation with two
+cable failures (a shorter one and a longer one).
+times: one lasting100 𝜇sstarting at 𝑡=100𝜇s, and another
+lasting200𝜇sstarting at𝑡=350𝜇s.
+In Figure 7, OPS keeps choosing all paths equally (although
+at lower rate due to CC activation), while REPS, once it enters
+freezing mode, stops selecting the failing paths all together
+after only one timeout period (order of tens of microseconds).
+Afterwards, once the failure stops, REPS also exits freezing
+mode and converges once again to use all paths. The overall
+result is that, compared to OPS, REPS completes the workload
+more than 35% faster even with such a short failure and,
+more importantly, reduces the number of dropped packets
+by2.5×. We showcase a similar analysis for incremental and
+concurrent failures in Appendix C.3.
+Macroscopic analysis: We showcase three cases with a se-
+ries of failure modes in Figure 8. We introduce each failure
+mode after a fixed interval to highlight how REPS dynam-
+ically reacts to changing network conditions, and then let
+the failure persist for the remainder of the experiment. We
+can see when dealing with total failures that REPS provides
+a dramatic speedup over OPS but also other load balancer
+algorithms. This is because offreezing modewhich helps
+REPS stick to the safe path configuration in its cache, allow-
+ing it to react immediately upon failure, much faster than
+=== PAGE 10 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+010 20 30 40 50 60 70
+Speedup vs OPSOne Failed
+Cable
+One Failed
+Switch
+One Failed
+Switch/Cable
+5% Failed
+Cables
+5% Failed
+Switches
+5% Failed
+Switches/Cables
+BER Cable 1%
+BER Switch 1%Failure ModePermutation 8MiB
+2.5 5.0 7.510.0 12.5 15.0 17.5
+Speedup vs OPSOne Failed
+Cable
+One Failed
+Switch
+One Failed
+Switch/Cable
+5% Failed
+Cables
+5% Failed
+Switches
+5% Failed
+Switches/Cables
+BER Cable 1%
+BER Switch 1%Failure Mode
+123456789
+Speedup vs OPS (Avg FCT)One Failed
+Cable
+One Failed
+Switch
+One Failed
+Switch/Cable
+5% Failed
+Cables
+5% Failed
+Switches
+5% Failed
+Switches/Cables
+BER Cable 1%
+BER Switch 1%Failure ModeDC Traces - 100% Load Ring AllReduce
+OPS Flowlet BitMap MPRDMA PLB REPS
+Figure 8.REPS performance under different failure modes in a 8 MiB permutation, DC traces at 100% load and a ring AllReduce.
+the time ECMP routing takes to converge and exclude the
+failing path. Positively, we note that the gains with REPS
+increase with the amount of failures. Furthermore, random
+drops do not affect negatively REPS performance. MPRDMA
+also performs well on average thanks to its self-clocking
+mechanism.
+0 10 20 30 40 50
+Network Cables Failure Percentage (%)20004000Max FCT (μs)
+2% 8%10%13%19%14%186%264%254%267%291%304%
+PLB
+REPS
+Theoretical BestSlowdown over
+Theoretical Best
+Figure 9.Extreme failures scenario.
+To further demonstrate the resilience of REPS, we evalu-
+ate its performance under an extreme and unlikely scenario
+characterized by increasingly large and long-lasting network
+failures during a permutation. As shown in Figure 9, REPS
+performs close to an ideal load balancer, even with 50% of net-
+work cables failing, while PLB, the second-best alternative,
+lags significantly behind.
+This analysis proves that REPS is able to guarantee good load
+balancing performance under short-lived failures, long-lived
+failures and a combination of the two even with catastrophi-
+cally high failure rates.
+4.4 REPS-FPGA Evaluation
+4.4.1 Healthy Symmetric Network Conditions.The
+first set of results focuses on a baseline healthy symmetric
+network configuration. Figure 10a shows per-flow goodput
+defined as end-to-end useful bit rate observed by application,
+after header, overheads, retransmissions, etc. We use OPS
+and REPS across two experimental configurations: denoted
+assetup-1andsetup-2. Insetup-1, all FPGA endpoints under
+the two T0s are active while insetup-2, 40 out of 64 FPGA
+endpoints are active.
+We present results from both of these configurations as
+we observe small unexpected performance variations de-
+pending on which and how many switch ports are activein experiments near the peak network performance levels
+using all switch ports (setup-1). These variations appear to be
+related to internal switch microarchitectural details such as
+port-buffer affinity and vendor-specific scheduling policies.
+Thesetup-2uses a subset of the switch ports and eliminates
+most of these vendor-specific and implementation-related
+behaviors. To get a better understanding of this behavior
+we performed a sweep where we capped the TX rate of our
+FPGA NICs and discovered that the slight degradation for
+setup-1when using REPS appears to subside if the TX rate is
+capped at 95 Gbps.
+4.4.2 Asymmetric Network Conditions.We evaluate
+the performance of REPS under asymmetric network con-
+ditions. We connect 16 endpoints through two T0 switches
+(8 endpoints each) with a total of 4 links to a pair of T1
+switches. To demonstrate the adaptive load balancing capa-
+bilities of REPS, we change the link speed of one T0-T1 link
+from 400 Gbps to 200 Gbps, creating asymmetry in the net-
+work. Figure 10b shows the per-flow goodput as observed
+by the application while Figure 11a the FCT distribution.
+OPS sends packets across all paths (including those crossing
+the 200 Gbps link) with equal probability and is ultimately
+capped by the slower 200 Gbps path. The ECN marking on
+the 200 Gbps path causes the CC algorithm to throttle all
+flows and eventually match the capacity of that single slower
+link, thus leading to underutilization of the remaining 400
+Gbps links (that are running at 50% utilization).
+REPS can gracefully adapt in such a scenario as the cached
+entropies will reflect the network asymmetry and result in
+a path distribution that is skewed to tailor to the relative
+capacity of the available paths. In this example, REPS can
+reach high utilization with average per-flow goodput within
+5% of the ideal fair-share target.
+4.4.3 Network Failures.We also evaluate the performance
+of REPS in the presence of network failures. To demonstrate
+the robustness and resilience of REPS in the context of link
+failures, Figure 11b shows total packet drops (average across
+five runs each) observed in a large-scale 128 endpoint run
+(endpoints split across 2 T0s connected through 8 T1s) where
+we abruptly bring down a T0-T1 link during the experiment.
+=== PAGE 11 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+Switch setup-1 Switch setup-2
+Switch Setup020406080100120Avg. Flow Goodput (Gbps)Ideal Share
+REPSOPS REPS OPS
+(a)Symmetric Network
+OPS REPS
+Load Balancing Algorithm020406080100Avg. Flow Goodput (Gbps)Ideal Share (b)Asymmetric Network
+Figure 10.REPS-FPGA impact on goodput.
+0250 500 750 1000
+Flow Completion Time (μs)0100 k200 k300 k400 k500 k600 k# MessagesREPS
+OPS
+(a)Asymmetric Network
+OPS REPS
+Load Balancing Algorithm0500100015002000# Packet Drops (103)Max
+Min (b)Link Failure
+Figure 11.REPS-FPGA impact on FCT and packet drops
+While the network is trying to recover from the impact of
+this event (which in our environment can take in the or-
+der of 100s of milliseconds), OPS continues sending packets
+across all paths (including those affected by the link that
+went down). The freezing capability of REPS can quickly
+adapt to such events (within the order of an RTO) and avoid
+sending packets down the affected paths as the entropy cache
+is replenished from packets traversing healthy paths.
+4.5 REPS Applicability
+In this section, we briefly evaluate REPS, in simulations, un-
+der different scenarios by changing the ACK coalescing ratio,
+the EVS size and, the underlying CC algorithm. Generally,
+we believe that REPS can work well under many different
+circumstances, topologies and workloads.
+4.5.1 ACK Coalescing.We have primarily evaluated REPS
+without ACK coalescing, as this configuration allows REPS to
+operate with the most up to date data. However, some trans-
+port protocols permit ACK coalescing, where the receiver
+sends an ACK packet only after receiving 𝑛data packets
+from the sender. In theory, the coalesced ACK packet could
+return all previous non-ECN marked entropies in its header
+(we call this configurationACK+Carry EVs). As an alternative
+approach, each entropy could be assigned a lifespan in the
+REPS buffer and reused𝑛times (ACK+Reuse EVs).
+We run an 8 MiB permutation simulating different ACK
+coalescing ratios and only the standard REPS configuration.
+As we can see in the left part of Figure 12, REPS with 2:1,
+4:1, and 8:1 coalescing ratios does significantly better than
+OPS, while with 16:1 it starts losing its advantage. However,
+180 190 200 210 220
+Flow Completion Time (μs)0.00.20.40.60.81.0CDF
+0 1000 2000 3000 4000 5000
+Flow Completion Time (μs)0.00.20.40.60.81.0CDFREPS 5x 
+faster
+even at 
+16:1 ratio5% Network Failures
+REPS and
+OPS similar
+performance
+at 16:1 ratio 
+(~230/uni03BCs)No Failures
+1:1 Ratio 2:1 Ratio 4:1 Ratio 8:1 Ratio 16:1 Ratio
+OPS REPSFigure 12.Performance with different ACK coalescing ratios
+during an 8MiB permutation.
+it should be noted that in case of asymmetries or failures
+(right Figure 12), REPS does much better even at 16:1 ratio.
+We confirm these results theoretically in Appendix C.1.
+Figure 13 demonstrates thatCarry EVsandReuse EVsare
+the preferred REPS variants for ACK coalescing, particularly
+under high coalescing ratios. We leave extensions of this
+approach to future work.
+Symmetric
+T opologyAsymmetric
+T opologySymmetric
+With Failures0200400600Max FCT (µs)
+REPS
+REPS+Carry EVs
+REPS+Reuse EVs
+OPS16:1 Ack
+Ratio
+Figure 13.Different REPS variants for ACK coalescing.
+Finally, we note that the trade-off of sending more ACKs
+is worth the effort if the underlying hardware supports such
+rate and the impact on the network traffic is minimal (~1%).
+4.5.2 EVS Size.Practical implementations make use of
+hashing functions to map EVs onto output ports. We show,
+first theoretically and then with simulations, that while using
+a small EVS can lead to high inherent load balancing issues,
+using216EVs is very close to uniformly random.
+We investigate the phenomenon that a small EVS leads to
+poor load balancing of the output ports of a switch in the
+case of a fat tree topology.
+We use a balls-into-bins model [ 56], where𝑚balls are
+thrown, uniformly and independently, at random into 𝑛bins.
+The goal is to determine the largest number of balls in any
+bin, referred to as themaximum load 𝑙(𝑚,𝑛) . We define the
+load imbalance 𝜆𝑚,𝑛as𝑙(𝑚,𝑛)
+𝑚/𝑛−1, representing the extent to
+which the most heavily loaded bin exceeds the average.
+In our setting, the output ports correspond to bins and
+the EVs correspond to balls. In our model, 𝜆𝑚,𝑛represents
+the load imbalance of the EVs onto uplinks. Since EVs are
+=== PAGE 12 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+chosen for packets uniformly at random, the load balancing
+of EVs directly affects the load balancing of packets onto
+output ports.
+The load imbalance depends on the average number of
+balls per bin (i.e.,𝑚
+𝑛): if𝑚=𝑛 , then the load imbalance is
+Θ log𝑛
+log log𝑛with high probability. However, when the ratio
+of balls to bins𝑚
+𝑛≫log𝑛 , the load imbalance tends to zero
+with high probability [ 56]. In conclusion, for OPS and a fixed
+number of flows, we expect high load imbalance with a small
+EVS and near-zero load imbalance as the EVS increases.
+We confirm this theoretical analysis with simulations of
+the load imbalance. Figures 14a and 14b show the distribution
+of the load imbalance for1and32unique flows, respectively.
+We note that each flow is from a different sender and will
+hence have different header fields that will be used in the
+hashing function regardless of the EV value. We note that
+for each case, we throw for each active flow a number of
+balls equal to the EVS size, with each ball being a unique
+EV. We can see that for 32 flows, choosing less than28EVs
+can lead to more than10%load-imbalance, whereas216EVs
+guarantee less than a1%load imbalance.
+5678910111213141516
+EVS Size (2^x)012345Load Imbalance
+2.92
+1.82
+1.25
+0.820.570.370.280.200.140.100.070.05Average Load Imbalance
+95% Percentile Range
+(a)1 flow active
+5678910111213141516
+EVS Size (2^x)0.00.20.4Load Imbalance
+0.35
+0.27
+0.19
+0.13
+0.090.070.050.030.030.020.020.01Average Load Imbalance
+95% Percentile Range (b)32 flows active
+Figure 14.Expected load imbalance at a switch (32 uplinks).
+Moreover, this requirement also grows with the number
+of output ports in a switch as demonstrated in Section 5.1.
+On the other hand, REPS, due to its adaptive nature, can
+drastically reduce the EVS size and still work well. We show
+this in the left plot of Figure 15 where we compare, in a real
+scenario, OPS and REPS when using 32, 256, and 64K EVs.
+REPS works equally well with 256 and 64K EVs and is only
+8% slower with 32 EVs. On the other hand, OPS is 21% and
+64% slower with 256 and 32 EVs when compared to 64K. This
+confirms that REPS could potentially work well even just
+with 1 byte for the EVS. We note that while OPS could be
+implemented without using EVS, such as through round-
+robin selection or by making random choices directly at the
+switch, these approaches introduce additional challenges
+(Section 5.2).
+4.5.3 Different CC Algorithms.REPS has been designed
+to work with any CC algorithm as long as there is no over-
+reaction to out-of-order packets and ECN support. In this
+paper, we have, so far, evaluated REPS working alongside a
+tuned version of DCTCP (similar to what is used in MPRDMA[45]). However, as we will see, REPS can work well even with
+other algorithms. Moreover, we envision also a version of
+REPS that could work just with delay if ECN is not supported
+but we do not go into details here. For example, in the right
+plot of Figure 15, we run an 8 MiB permutation workload
+without failure for DCTCP, EQDS and a proprietary CC
+algorithm. REPS can help all of these CC algorithms when
+compared to OPS.
+Intuitively, REPS works on a per-packet basis, meaning
+each flow simultaneously uses many paths. If one path starts
+encountering congestion, REPS will quickly route away from
+it. Temporarily, the CC algorithm might slightly lower the
+congestion window or sending rate. For instance, if it uses
+only ECN as its signal and only one path is congested, the
+decrease would be minimal (assuming a CC that does not
+overreact to each ECN-mark). Moreover, non-ECN packets
+from uncongested paths would quickly restore the window.
+If all paths are congested, REPS cannot add capacity, and the
+CC rightly lowers the congestion window; this is precisely
+what we observe in the incast experiments where every
+balancer behaves the same (Figure 3). In these cases REPS
+(like all routing algorithms) cannot fix the issue and the CC
+must kick-in to correctly adjust the sending rate. Finally, we
+note that one could potentially optimize the CC further for
+a smoother REPS integration. For example, the CC could
+activate only after a certain degree of congestion is detected,
+while leaving the initial work to the load balancer. Having
+said that, this is mostly orthogonal to REPS and also affects
+other load balancers.
+180 190 200
+Flow Completion Time (us)0.00.20.40.60.81.0CDF
+180 200 220 240 260
+Flow Completion Time (μs)0.00.20.40.60.81.0CDFMax FCT is 
+~325/uni03BCs (64% slower
+than REPS)
+REPS with 32 EVs 
+performs as well
+as OPS with 64K EVsREPS is superior 
+even when 
+changing CCsDiﬀerent EVS Sizes Diﬀerent CCs
+DCTCP EQDS INTERNAL 32 EVs 256 EVs 64K EVs
+OPS REPS
+Figure 15.Performance with different EVs sizes and CCs
+during an 8MiB permutation.
+4.5.4 Topology Scaling.We then shift to verifying REPS
+performance when changing the scale of the topology. To do
+this, we run a 8MiB tornado workload and vary the number
+of nodes in the topology. We range from 128 nodes (switches
+with 16 ports) to 8192 nodes (switches with 128 ports). More-
+over, we also vary the EVS size and compare once again
+REPS to OPS. Figure 16 shows the maximum completion
+time for each configuration and we run each experiment
+multiple times to account for randomness in the initial EVs.
+As we can see, REPS performs well for all topology sizes
+=== PAGE 13 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+and almost all EVS sizes with only a small regression when
+using 16 EVs. This, potentially, means that REPS could work
+with far less than 16 bits needed for the EV, even at large
+scale. On the other hand, OPS suffers much more due to its
+non-adaptivity when having a limited number of EVs with
+16 values running more than twice slower than when us-
+ing the full 16 bits (65536 possible values). We also observe
+a slight upward trend in the maximum FCT with OPS as
+topology size increases. The key point is that, with REPS,
+even if a limited number of EVs prevents each flow from us-
+ing all available paths, the increased adaptivity compensates
+for this. In addition, other packet-header fields contribute
+additional randomness because switch hashing functions
+combine them with the EV. This observation is consistent
+with the analysis in Section 4.5.2.
+128
+ 1024
+ 4096
+ 8192
+Topology size (nodes)
+200
+250
+300
+350
+400
+450Max FCT (µs)
+EVS Size
+16
+64256
+10244096
+65536
+REPS OPS
+128
+ 1024
+ 4096
+ 8192
+185
+190
+195REPS 1.8-2.4x 
+faster with 16 EV sREPS with only 64
+EVs is better than
+OPS with 65536
+Ideal Completion Time
+Figure 16.Performance with different EVS sizes and topol-
+ogy sizes during an 8MiB permutation.
+5 Theoretical Verification
+To support our experimental findings, we present a theoret-
+ical first principles analysis of OPS and demonstrate how
+it can lead to arbitrarily long queues. To address this issue,
+we develop a newrecycled balls-into-binsmodel and prove
+its local convergence. This model serves as the theoretical
+intuition behind the REPS protocol (Section 3).
+5.1 Recycled Balls-into-Bins Model
+At maximum injection rate, OPS suffers from severe load-
+imbalance that eventually leads to queues of arbitrary length
+building up. We explain this behavior with an infinite batched
+balls-into-bins model [ 9,11,44]. In contrast, we show that
+recycling good paths such as in REPS leads to a convergent
+behavior and logarithmically-bounded queues.
+In our switch model, each output port corresponds to a
+bin. At each time step, every non-empty bin removes one
+element. Afterward, a new set of balls (packets) arrives and
+is distributed among the bins. In our setting, we focus on the
+case where𝑛balls arrive in each time step, representing full
+throughput. The maximum queue length at any time step
+corresponds to the maximum load of any bin at that time
+step. Balls are removed in FIFO order from the bins.In OPS, balls are allocated to bins uniformly at random.
+In what follows, we assume the EVS is sufficiently large
+(i.e., 16 bits), allowing us to model the assignments as uni-
+formly random. If balls arrive at a rate of 𝜆𝑛for𝜆< 1,
+the process remains stable. The maximum load at any time
+step is𝑂 1
+1−𝜆log𝑛
+1−𝜆with high probability [ 11] and with
+probability approaching1, there is always a bin containing
+Ω 1
+1−𝜆log𝑛balls [ 11]. In the limit as 𝜆→ 1, this implies
+that some bin will eventually become arbitrarily overloaded.
+In the context of load balancing, this means that at the maxi-
+mum injection rate,oblivious random spraying leads to un-
+bounded queue lengths. Intuitively, this occurs because 𝑛balls
+are introduced at each step, but fewer than 𝑛may be removed,
+as some output ports may remain unselected.
+As𝑛increases, the maximum load grows, exacerbating
+congestion in OPS. Figure 17 illustrates this effect for 𝜆=
+0.99, where larger numbers of bins (output ports) result in
+faster-growing maximum queues.
+0 200 400 600 800 1000
+Balls-into-bins Round20406080Avg. Max. Queue
+Size (Pkts)
+4 output ports
+8 output ports
+16 output ports32 output ports
+64 output ports
+128 output ports
+Figure 17.Simulating 1000 rounds of balls-into-bins.
+We propose a new model, calledrecycled balls-into-bins
+and prove it converges locally to a load-balanced state with
+bounded queue lengths, even at maximum injection rate.
+In the recycled balls-into-bins model, we keep a set of
+𝑏·𝑛 colors (for some constant 𝑏) and a threshold 𝜏. We
+cycle through the colors in round-robin fashion in batches
+of𝑛colors. In each time step, we remove a ball from each
+nonempty bin. If a bin has at most 𝜏balls, the color of the
+removed ball remembers the bin, unless it already remembers
+another bin. If the bin has more than 𝜏balls, the color forgets
+its bin. Then, for each color in the batch that remembers a
+bin, throw a ball into the remembered bin. For all colors in
+the batch without a remembered bin, throw a ball uniformly
+at random. We show that, for a single switch,recycled balls-
+into-bins converges, meaning all colors remember a bin and
+keep the same bin remembered.
+Theorem 5.1.For 𝑛≥16,𝜏≥4ln𝑛,𝑏≥2.4ln𝑛, recycled
+balls-into-bins converges in 𝑂(𝑛log𝑛) steps. Every bin has
+𝑂(log𝑛)elements throughout, with probability1−𝑜(1).
+The proof in Appendix B shows that recycled balls-into-
+bins converges as bins fill and stabilize below the threshold.
+To visualize these behaviors, we model the balls-into-bins
+problem with both OPS and with the recycled balls improve-
+ment. In Figure 18, we set 𝑛=5(for visualization purposes,
+but this holds true for more realistic 𝑛values) and showcase
+=== PAGE 14 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+0 25 50 75 100 125 150 175 200
+Balls-into-bins Round01020Queue Size (Pkts)τOPS
+Recycled Balls
+Figure 18.Simulating 200 rounds of balls-into-bins.
+the queues’ evolution for OPS and the recycled balls model.
+The results confirm that while OPS leads to unbounded
+queue growth, the recycled balls model converges, keeping
+all queues below the threshold ( 𝜏) value, consistent with our
+previous network simulations (e.g., Figure 2 and Figure 4).
+5.2 Limitations and Alternatives
+While the provided model performs well in an idealized set-
+ting with maximal injection rates, in a real network scenario,
+CC algorithms would reduce the sending rate if a large queue
+were to build up. However, such activations of the CC would
+result in a slowdown of the sending rate and, hence, an in-
+crease of the completion time of a workload as we can see
+in Section 4.3.1. Moreover, we note that while real scenarios
+would have more subtle interactions not modelled here (like
+using distinct 𝐾𝑀𝑖𝑛 and𝐾𝑀𝑎𝑥 ), the key results hold and
+are consistent with our evaluations in Section 4. Finally, we
+note that here we provide a proof only about the local con-
+vergence of REPS and that other models such as static path
+assignments and round-robin across the ports would also
+work well and potentially provide no queueing. However,
+such approaches are not viable in reality for a series of rea-
+sons: they cannot react well to partial or total failures, they
+would struggle with multi-tier topologies and they require
+detailed knowledge of the underlying workloads [25].
+6 Related Work
+The literature for load balancing designs is vast, however
+most of it focuses on TCP-based deployments where out-of-
+order packets are not desirable [ 4,10,20,65,68]. In contrast,
+REPS aligns with a new transport paradigm (UltraEther-
+net [18], Adaptive RoCE by NVIDIA [ 50], Falcon [ 62]) where
+out-of-order packets help to leverage the capacity of multi-
+path networks.
+Generally, most load balancers work at different granular-
+ity: per-flow, sub-flow or per-packet. ECMP [ 35] is a per-flow
+solution and susceptible to flow collisions and are oblivious
+to congested paths. Solutions like Hedera [ 4] and MicroTE
+[10] require a global controller which is not desirable in pro-
+duction datacenters [ 25]. For these reasons, many sub-flow
+solutions like Flowlet Switching [ 65], Flowcut Switching [ 12],
+Presto [ 30], CONGA [ 5], PLB [ 55], FlowBender [ 38] have
+been proposed. However, some of these solutions are still
+congestion oblivious (Flowlet, Presto), react too slowly for
+AI/ML bursty and intense traffic (PLB, FlowBender), requirespecialized switches (CONGA). Moreover, most of these solu-
+tions are unable to quickly deal with blackholes and failures.
+Load balancers with per-packet granularity, such as OPS
+[20] or DRILL [ 26], help drastically reduce ECMP collisions,
+but are still oblivious to asymmetries (for OPS) or require
+switch support (for DRILL). As demonstrated in Section 5
+OPS can suffer even in symmetric cases. MPRDMA [ 45] also
+uses ECN for load balancing like REPS, however it requires
+probing and ACK clocking and does not offer caching of
+entropies. Hermes [ 68] combines both ECN and delay but it
+works best with TCP-like protocols and has many parameters
+with complex tuning.
+ConWeave [ 63] is designed specifically for RDMA net-
+works and offers a solution by masking out-of-order packets
+in commodity RNICs but it requires changes to TOR switches
+and has limited scalability.
+Proteus [ 36] focuses on optimizing the load balancing of
+lossless PFC networks while REPS focuses on lossy networks.
+7 Conclusion
+We presented REPS, a simple, lightweight, yet highly effec-
+tive load-balancing mechanism designed to meet the con-
+straints of next-generation datacenter networks tailored for
+AI workloads. As demonstrated in our extensive evaluations,
+conducted through both simulations and FPGA hardware,
+REPS’ adaptive entropy caching enhances end-to-end per-
+formance across multiple critical metrics, including average
+flow completion time, runtime, and packet loss. REPS out-
+performs ECMP and OPS by up to 6x and 1.25x in symmetric
+networks, and by up to 5x and 2x in asymmetric networks,
+outperforming OPS by as much as 100x during short-term
+transient link failures while reducing packet drops by over
+70x. Moreover, REPS consistently beats or matches other
+state-of-the-art algorithms in all scenarios evaluated. We
+also showed how REPS can work well under various net-
+work configurations demonstrating its flexibility to adapt
+to different scenarios while remaining light-weight on NIC
+memory requiring only 25 bytes of state per-connection.
+Acknowledgments
+We thank our shepherd, Daniel Amir, and the anonymous
+reviewers of EuroSys ’26 for their valuable feedback. This
+work is supported by the European Union’s Horizon Europe
+under grant 101175702 (NET4EXA), the Sapienza University
+Grants ADAGIO and D2QNeT (Bando per la ricerca di Ateneo
+2023 and 2024), the European Research Council (ERC) under
+the European Union’s Horizon 2020 research and innovation
+program (grant agreement PSAP, No. 101002047), and a CAF
+America grant. We thank the Swiss National Supercomputing
+Center (CSCS) for providing the computational resources
+used in this work. We also thank Marcin Copik, Ales Kubicek,
+and Nadeen Gebara for providing their valuable feedback.
+We used ChatGPT solely for text editing and quality checks.
+=== PAGE 15 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+References
+[1]2004. Infiniband Performance Review. In2004 USENIX An-
+nual Technical Conference (USENIX ATC 04). USENIX Association,
+Boston, MA.https://www.usenix.org/conference/2004-usenix-annual-
+technical-conference/infiniband-performance-review
+[2]Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge
+Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt,
+Sam Altman, Shyamal Anadkat, et al .2023. Gpt-4 technical report.
+arXiv preprint arXiv:2303.08774(2023).
+[3]Popa Adrian, Dumitrescu Dragos, Handley Mark, Nikolaidis Geor-
+gios, Lee Jeongkeun, and Raiciu Costin. 2022. Implementing packet
+trimming support in hardware. (2022). arXiv:cs.NI/2207.04967
+[4]Mohammad Al-Fares, Sivasankar Radhakrishnan, Barath Raghavan,
+Nelson Huang, and Amin Vahdat. 2010. Hedera: dynamic flow sched-
+uling for data center networks. InProceedings of the 7th USENIX Con-
+ference on Networked Systems Design and Implementation (NSDI’10).
+USENIX Association, USA, 19.
+[5]Mohammad Alizadeh, Tom Edsall, Sarang Dharmapurikar, Ramanan
+Vaidyanathan, Kevin Chu, Andy Fingerhut, Vinh The Lam, Francis Ma-
+tus, Rong Pan, Navindra Yadav, and George Varghese. 2014. CONGA:
+distributed congestion-aware load balancing for datacenters. InPro-
+ceedings of the 2014 ACM Conference on SIGCOMM (SIGCOMM ’14).
+Association for Computing Machinery, New York, NY, USA, 503–514.
+https://doi.org/10.1145/2619239.2626316
+[6]Mohammad Alizadeh, Albert Greenberg, David A. Maltz, Jitendra
+Padhye, Parveen Patel, Balaji Prabhakar, Sudipta Sengupta, and Murari
+Sridharan. 2010. Data Center TCP (DCTCP).SIGCOMM Comput.
+Commun. Rev.40, 4 (aug 2010), 63–74.https://doi.org/10.1145/1851275.
+1851192
+[7]Anix Anbiah and Krishna M. Sivalingam. 2022. Efficient failure recov-
+ery techniques for segment-routed networks.Computer Communica-
+tions182 (2022), 1–12.https://doi.org/10.1016/j.comcom.2021.10.033
+[8]Infiniband Trade Association. 2024. Supplement to InfiniBand Ar-
+chitecture Specification Volume 1 Release 1.2.1 Annex A17: RoCEv2.
+(2024).
+[9]Luca Becchetti, Andrea Clementi, Emanuele Natale, Francesco
+Pasquale, and Gustavo Posta. 2019. Self-stabilizing repeated balls-
+into-bins.Distributed Comput.32, 1 (2019), 59–68.https://doi.org/10.
+1007/S00446-017-0320-4
+[10] Theophilus Benson, Ashok Anand, Aditya Akella, and Ming Zhang.
+2011. MicroTE: fine grained traffic engineering for data centers.
+InProceedings of the Seventh COnference on Emerging Networking
+EXperiments and Technologies (CoNEXT ’11). Association for Com-
+puting Machinery, New York, NY, USA, Article 8, 12 pages.https:
+//doi.org/10.1145/2079296.2079304
+[11] Petra Berenbrink, Tom Friedetzky, Peter Kling, Frederik Mallmann-
+Trenn, Lars Nagel, and Chris Wastell. 2018. Self-Stabilizing Balls and
+Bins in Batches - The Power of Leaky Bins.Algorithmica80, 12 (2018),
+3673–3703.https://doi.org/10.1007/S00453-018-0411-Z
+[12] Tommaso Bonato, Daniele De Sensi, Salvatore Di Girolamo, Abdulla
+Bataineh, David Hewson, Duncan Roweth, and Torsten Hoefler. 2026.
+Flowcut Switching: High-Performance Adaptive Routing With In-
+Order Delivery Guarantees.IEEE Transactions on Networking34 (2026),
+1974–1987.https://doi.org/10.1109/TON.2025.3636209
+[13] Broadcom. 2024. Tomahawk 5 Switch. (2024).
+https://www.broadcom.com/products/ethernet-
+connectivity/switching/strataxgs/bcm78900-series (accessed
+01/24).
+[14] Yanpei Chen, Rean Griffith, Junda Liu, Randy H. Katz, and Anthony D.
+Joseph. 2009. Understanding TCP incast throughput collapse in data-
+center networks. InProceedings of the 1st ACM Workshop on Research
+on Enterprise Networking (WREN ’09). Association for Computing Ma-
+chinery, New York, NY, USA, 73–82.https://doi.org/10.1145/1592681.
+1592693[15] Peng Cheng, Fengyuan Ren, Ran Shu, and Chuang Lin. 2014. Catch
+the Whole Lot in an Action: Rapid Precise Packet Loss Notification
+in Data Center. In11th USENIX Symposium on Networked Systems
+Design and Implementation (NSDI 14). USENIX Association, Seattle, WA,
+17–28.https://www.usenix.org/conference/nsdi14/technical-sessions/
+presentation/cheng
+[16] Fan Chung and Linyuan Lu. 2006. Concentration inequalities and
+martingale inequalities: a survey.Internet Mathematics3, 1 (2006), 79
+– 127.
+[17] Ultra Ethernet Consortium. [n. d.]. Ultra Ethernet Specification Update
+- Ultra Ethernet Consortium — ultraethernet.org.https://ultraethernet.
+org/ultra-ethernet-specification-update/. ([n. d.]). [Accessed 16-09-
+2024].
+[18] Ultra Ethernet Consortium. 2024. Ultra Ethernet. (2024).
+https://ultraethernet.org/.
+[19] Daniele De Sensi, Salvatore Di Girolamo, Kim H. McMahon, Dun-
+can Roweth, and Torsten Hoefler. 2020. An In-Depth Analysis of the
+Slingshot Interconnect. InSC20: International Conference for High Per-
+formance Computing, Networking, Storage and Analysis. 1–14.https:
+//doi.org/10.1109/SC41405.2020.00039
+[20] Advait Dixit, Pawan Prakash, Y. Charlie Hu, and Ramana Rao Kompella.
+2013. On the impact of packet spraying in data center networks. In
+2013 Proceedings IEEE INFOCOM. 2130–2138.https://doi.org/10.1109/
+INFCOM.2013.6567015
+[21] Benjamin Doerr. 2020. Probabilistic Tools for the Analysis of Random-
+ized Optimization Heuristics. InTheory of Evolutionary Computation
+- Recent Developments in Discrete Optimization, Benjamin Doerr and
+Frank Neumann (Eds.). Springer, 1–87.https://doi.org/10.1007/978-3-
+030-29414-4_1
+[22] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Ka-
+dian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten,
+Amy Yang, Angela Fan, et al .2024. The llama 3 herd of models.arXiv
+preprint arXiv:2407.21783(2024).
+[23] S. Floyd and V. Jacobson. 1993. Random early detection gateways
+for congestion avoidance.IEEE/ACM Transactions on Networking1, 4
+(1993), 397–413.https://doi.org/10.1109/90.251892
+[24] Sally Floyd, Dr. K. K. Ramakrishnan, and David L. Black. 2001. The
+Addition of Explicit Congestion Notification (ECN) to IP. RFC 3168.
+(Sept. 2001).https://doi.org/10.17487/RFC3168
+[25] Adithya Gangidi, Rui Miao, Shengbao Zheng, Sai Jayesh Bondu,
+Guilherme Goes, Hany Morsy, Rohit Puri, Mohammad Riftadi,
+Ashmitha Jeevaraj Shetty, Jingyi Yang, Shuqiang Zhang, Mikel Jimenez
+Fernandez, Shashidhar Gandham, and Hongyi Zeng. 2024. RDMA
+over Ethernet for Distributed Training at Meta Scale. InProceed-
+ings of the ACM SIGCOMM 2024 Conference (ACM SIGCOMM ’24).
+Association for Computing Machinery, New York, NY, USA, 57–70.
+https://doi.org/10.1145/3651890.3672233
+[26] Soudeh Ghorbani, Zibin Yang, P. Brighten Godfrey, Yashar Ganjali,
+and Amin Firoozshahian. 2017. DRILL: Micro Load Balancing for Low-
+Latency Data Center Networks. InProceedings of the Conference of the
+ACM Special Interest Group on Data Communication (SIGCOMM ’17).
+Association for Computing Machinery, New York, NY, USA, 225–238.
+https://doi.org/10.1145/3098822.3098839
+[27] Haryadi S. Gunawi, Riza O. Suminto, Russell Sears, Casey Golliher,
+Swaminathan Sundararaman, Xing Lin, Tim Emami, Weiguang Sheng,
+Nematollah Bidokhti, Caitie McCaffrey, Gary Grider, Parks M. Fields,
+Kevin Harms, Robert B. Ross, Andree Jacobson, Robert Ricci, Kirk
+Webb, Peter Alvaro, H. Birali Runesha, Mingzhe Hao, and Huaicheng
+Li. 2018. Fail-Slow at Scale: Evidence of Hardware Performance Faults
+in Large Production Systems. In16th USENIX Conference on File and
+Storage Technologies (FAST 18). USENIX Association, Oakland, CA,
+1–14.https://www.usenix.org/conference/fast18/presentation/gunawi
+=== PAGE 16 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+[28] Mark Handley, Costin Raiciu, Alexandru Agache, Andrei Voinescu,
+Andrew W. Moore, Gianni Antichi, and Marcin Wójcik. 2017. Re-
+Architecting Datacenter Networks and Stacks for Low Latency and
+High Performance. InProceedings of the Conference of the ACM Special
+Interest Group on Data Communication (SIGCOMM ’17). Association
+for Computing Machinery, New York, NY, USA, 29–42.https://doi.
+org/10.1145/3098822.3098825
+[29] Jun He and Xin Yao. 2004. A study of drift analysis for estimating
+computation time of evolutionary algorithms.Nat. Comput.3, 1 (2004),
+21–35.https://doi.org/10.1023/B:NACO.0000023417.31393.C7
+[30] Keqiang He, Eric Rozner, Kanak Agarwal, Wes Felter, John Carter,
+and Aditya Akella. 2015. Presto: Edge-Based Load Balancing for Fast
+Datacenter Networks. InProceedings of the 2015 ACM Conference on
+Special Interest Group on Data Communication (SIGCOMM ’15). As-
+sociation for Computing Machinery, New York, NY, USA, 465–478.
+https://doi.org/10.1145/2785956.2787507
+[31] Torsten Hoefler, Tommaso Bonato, Daniele De Sensi, Salvatore Di Giro-
+lamo, Shigang Li, Marco Heddes, Jon Belk, Deepak Goel, Miguel Castro,
+and Steve Scott. 2022. HammingMesh: A Network Topology for Large-
+Scale Deep Learning. InProceedings of the International Conference on
+High Performance Computing, Networking, Storage and Analysis (SC
+’22). IEEE Press, Article 11, 18 pages.
+[32] Torsten Hoefler, Ariel Hendel, and Duncan Roweth. 2022. The Conver-
+gence of Hyperscale Data Center and High-Performance Computing
+Networks.Computer55, 7 (July 2022), 29–37.https://doi.org/10.1109/
+MC.2022.3158437
+[33] Torsten Hoefler, Duncan Roweth, Keith Underwood, Robert Alver-
+son, Mark Griswold, Vahid Tabatabaee, Mohan Kalkunte, Surendra
+Anubolu, Siyuan Shen, Moray McLaren, Abdul Kabbani, and Steve
+Scott. 2023. Data Center Ethernet and Remote Direct Memory Ac-
+cess: Issues at Hyperscale.Computer56, 7 (2023), 67–77.https:
+//doi.org/10.1109/MC.2023.3261184
+[34] Torsten Hoefler, Karen Schramm, Eric Spada, Keith Underwood, Cedell
+Alexander, Bob Alverson, Paul Bottorff, Adrian Caulfield, Mark Hand-
+ley, Cathy Huang, Costin Raiciu, Abdul Kabbani, Eugene Opsasnick,
+Rong Pan, Adee Ran, and Rip Sohan. 2025. Ultra Ethernet’s Design Prin-
+ciples and Architectural Innovations. (2025). arXiv:cs.NI/2508.08906
+https://arxiv.org/abs/2508.08906
+[35] C. Hopps. 2009. Analysis of an Equal-Cost Multi-Path Algorithm. RFC
+2992. (Nov. 2009).https://www.ietf.org/rfc/rfc2992.txt
+[36] Jinbin Hu, Chaoliang Zeng, Zilong Wang, Junxue Zhang, Kun Guo,
+Hong Xu, Jiawei Huang, and Kai Chen. 2023. Enabling Load Balancing
+for Lossless Datacenters . In2023 IEEE 31st International Conference on
+Network Protocols (ICNP). IEEE Computer Society, Los Alamitos, CA,
+USA, 1–11.https://doi.org/10.1109/ICNP59255.2023.10355615
+[37] A. Iselt, A. Kirstadter, A. Pardigon, and T. Schwabe. 2004. Resilient
+routing using MPLS and ECMP. In2004 Workshop on High Performance
+Switching and Routing, 2004. HPSR.345–349.https://doi.org/10.1109/
+HPSR.2004.1303507
+[38] Abdul Kabbani, Balajee Vamanan, Jahangir Hasan, and Fabien Duch-
+ene. 2014. FlowBender: Flow-level Adaptive Routing for Improved
+Latency and Throughput in Datacenter Networks. InProceedings of
+the 10th ACM International on Conference on Emerging Networking
+Experiments and Technologies (CoNEXT ’14). Association for Comput-
+ing Machinery, New York, NY, USA, 149–160.https://doi.org/10.1145/
+2674005.2674985
+[39] John Kim, Wiliam J. Dally, Steve Scott, and Dennis Abts. 2008.
+Technology-Driven, Highly-Scalable Dragonfly Topology. In2008
+International Symposium on Computer Architecture. 77–88.https:
+//doi.org/10.1109/ISCA.2008.19
+[40] Yanfang Le, Rong Pan, Peter Newman, Jeremias Blendin, Abdul
+Kabbani, Vipin Jain, Raghava Sivaramu, and Francis Matus. 2024.
+STrack: A Reliable Multipath Transport for AI/ML Clusters. (2024).
+arXiv:cs.NI/2407.15266https://arxiv.org/abs/2407.15266[41] Johannes Lengler. 2020. Drift Analysis. InTheory of Evolutionary
+Computation - Recent Developments in Discrete Optimization, Benjamin
+Doerr and Frank Neumann (Eds.). Springer, 89–131.https://doi.org/10.
+1007/978-3-030-29414-4_2
+[42] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis,
+Teng Li, Adam Paszke, Jeff Smith, Brian Vaughan, Pritam Damania,
+et al.2020. Pytorch distributed: Experiences on accelerating data
+parallel training.arXiv preprint arXiv:2006.15704(2020).
+[43] Wenxue Li, Xiangzhou Liu, Yunxuan Zhang, Zihao Wang, Wei Gu,
+Tao Qian, Gaoxiong Zeng, Shoushou Ren, Xinyang Huang, Zheng-
+hang Ren, Bowen Liu, Junxue Zhang, Kai Chen, and Bingyang Liu.
+2025. Revisiting RDMA Reliability for Lossy Fabrics. InProceed-
+ings of the ACM SIGCOMM 2025 Conference (SIGCOMM ’25). As-
+sociation for Computing Machinery, New York, NY, USA, 85–98.
+https://doi.org/10.1145/3718958.3750480
+[44] Dimitrios Los and Thomas Sauerwald. 2023. Tight Bounds for Re-
+peated Balls-Into-Bins. In40th International Symposium on Theoretical
+Aspects of Computer Science, STACS 2023, March 7-9, 2023, Hamburg,
+Germany (LIPIcs), Petra Berenbrink, Patricia Bouyer, Anuj Dawar, and
+Mamadou Moustapha Kanté (Eds.), Vol. 254. Schloss Dagstuhl - Leibniz-
+Zentrum für Informatik, 45:1–45:22.https://doi.org/10.4230/LIPICS.
+STACS.2023.45
+[45] Yuanwei Lu, Guo Chen, Bojie Li, Kun Tan, Yongqiang Xiong, Peng
+Cheng, Jiansong Zhang, Enhong Chen, and Thomas Moscibroda. 2018.
+Multi-path transport for RDMA in datacenters. InProceedings of the
+15th USENIX Conference on Networked Systems Design and Implemen-
+tation (NSDI’18). USENIX Association, USA, 357–371.
+[46] Tesla Motors. 2024. Tesla Transport Protocol (TTPoE). (2024).
+https://github.com/teslamotors/ttpoe (accessed 09/24).
+[47] Maxim Naumov, Dheevatsa Mudigere, Hao-Jun Michael Shi, Jianyu
+Huang, Narayanan Sundaraman, Jongsoo Park, Xiaodong Wang, Udit
+Gupta, Carole-Jean Wu, Alisson G Azzolini, et al .2019. Deep learn-
+ing recommendation model for personalization and recommendation
+systems.arXiv preprint arXiv:1906.00091(2019).
+[48] Kathleen Nichols and Van Jacobson. 2012. Controlling Queue Delay:
+A modern AQM is just one piece of the solution to bufferbloat.Queue
+10, 5 (may 2012), 20–34.https://doi.org/10.1145/2208917.2209336
+[49] Nvidia. 2024. Networking for the Era of AI:
+The Network Defines the Data Center. (2024).
+https://nvdam.widen.net/s/bvpmlkbgzt/networking-overall-
+whitepaper-networking-for-ai-2911204 (accessed 01/24).
+[50] NVIDIA. 2024. NVIDIA Spectrum-X Network Platform Architecture.
+(2024). https://resources.nvidia.com/en-us-accelerated-networking-
+resource-library/nvidia-spectrum-x.
+[51] Vladimir Olteanu, Haggai Eran, Dragos Dumitrescu, Adrian Popa,
+Cristi Baciu, Mark Silberstein, Georgios Nikolaidis, Mark Handley, and
+Costin Raiciu. 2022. An edge-queued datagram service for all datacen-
+ter traffic. In19th USENIX Symposium on Networked Systems Design and
+Implementation (NSDI 22). USENIX Association, Renton, WA, 761–777.
+https://www.usenix.org/conference/nsdi22/presentation/olteanu
+[52] Christos Pelekis. 2017. Lower bounds on binomial and Pois-
+son tails: an approach via tail conditional expectations. (2017).
+arXiv:math.PR/1609.06651https://arxiv.org/abs/1609.06651
+[53] Bogdan Prisacari, German Rodriguez, Cyriel Minkenberg, and Torsten
+Hoefler. 2013. Bandwidth-optimal all-to-all exchanges in fat tree
+networks. InProceedings of the 27th International ACM Conference
+on International Conference on Supercomputing (ICS ’13). Associa-
+tion for Computing Machinery, New York, NY, USA, 139–148.https:
+//doi.org/10.1145/2464996.2465434
+[54] Kun Qian, Yongqing Xi, Jiamin Cao, Jiaqi Gao, Yichi Xu, Yu Guan,
+Binzhang Fu, Xuemei Shi Fangbo Zhu, Rui Miao, Chao Wang, Peng
+Wang, Pengcheng Zhang, Xianlong Zeng Zhiping Yao, Ennan Zhai,
+and Dennis Cai. 2024. Alibaba HPN: A Data Center Network for Large
+Language Model Training. (2024).
+=== PAGE 17 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+[55] Mubashir Adnan Qureshi, Yuchung Cheng, Qianwen Yin, Qiaobin Fu,
+Gautam Kumar, Masoud Moshref, Junhua Yan, Van Jacobson, David
+Wetherall, and Abdul Kabbani. 2022. PLB: congestion signals are
+simple and effective for network load balancing. InProceedings of
+the ACM SIGCOMM 2022 Conference (SIGCOMM ’22). Association for
+Computing Machinery, New York, NY, USA, 207–218.https://doi.org/
+10.1145/3544216.3544226
+[56] Martin Raab and Angelika Steger. 1998. "Balls into Bins" - A Simple
+and Tight Analysis. InRandomization and Approximation Techniques
+in Computer Science, Second International Workshop, RANDOM’98,
+Barcelona, Spain, October 8-10, 1998, Proceedings (Lecture Notes in Com-
+puter Science), Michael Luby, José D. P. Rolim, and Maria J. Serna (Eds.),
+Vol. 1518. Springer, 159–170.https://doi.org/10.1007/3-540-49543-6_13
+[57] Costin Raiciu, Sebastien Barre, Christopher Pluntke, Adam Green-
+halgh, Damon Wischik, and Mark Handley. 2011. Improving data-
+center performance and robustness with multipath TCP.SIGCOMM
+Comput. Commun. Rev.41, 4 (aug 2011), 266–277.https://doi.org/10.
+1145/2043164.2018467
+[58] Leah Shalev, Hani Ayoub, Nafea Bshara, and Erez Sabbag. 2020. A
+Cloud-Optimized Transport Protocol for Elastic and Scalable HPC.
+IEEE Micro40, 6 (2020), 67–73.https://doi.org/10.1109/MM.2020.
+3016891
+[59] Arjun Singh, Joon Ong, Amit Agarwal, Glen Anderson, Ashby Armis-
+tead, Roy Bannon, Seb Boving, Gaurav Desai, Bob Felderman, Paulie
+Germano, Anand Kanagala, Jeff Provost, Jason Simmons, Eiichi Tanda,
+Jim Wanderer, Urs Hölzle, Stephen Stuart, and Amin Vahdat. 2015.
+Jupiter Rising: A Decade of Clos Topologies and Centralized Control
+in Google’s Datacenter Network. InSigcomm ’15.
+[60] Preeti Singh, J. K. Rai, and Ajay K. Sharma. 2020. Bit Error Rate
+Analysis of AWG Based Add-Drop Hybrid Buffer Optical Packet
+Switch. In2020 2nd International Conference on Advances in Com-
+puting, Communication Control and Networking (ICACCCN). 454–458.
+https://doi.org/10.1109/ICACCCN51052.2020.9362921
+[61] Rachee Singh, Muqeet Mukhtar, Ashay Krishna, Aniruddha Parkhi,
+Jitendra Padhye, and David Maltz. 2021. Surviving switch failures in
+cloud datacenters.SIGCOMM Comput. Commun. Rev.51, 2 (may 2021),
+2–9.https://doi.org/10.1145/3464994.3464996
+[62] Arjun Singhvi, Nandita Dukkipati, Prashant Chandra, Hassan M. G.
+Wassel, Naveen Kr. Sharma, Anthony Rebello, Henry Schuh, Praveen
+Kumar, Behnam Montazeri, Neelesh Bansod, Sarin Thomas, Inho
+Cho, Hyojeong Lee Seibert, Baijun Wu, Rui Yang, Yuliang Li, Kai
+Huang, Qianwen Yin, Abhishek Agarwal, Srinivas Vaduvatha, Wei-
+huang Wang, Masoud Moshref, Tao Ji, David Wetherall, and Amin
+Vahdat. 2025. Falcon: A Reliable, Low Latency Hardware Transport.
+InProceedings of the ACM SIGCOMM 2025 Conference (SIGCOMM ’25).
+Association for Computing Machinery, New York, NY, USA, 248–263.
+https://doi.org/10.1145/3718958.3754353
+[63] Cha Hwan Song, Xin Zhe Khooi, Raj Joshi, Inho Choi, Jialin Li, and
+Mun Choon Chan. 2023. Network Load Balancing with In-network
+Reordering Support for RDMA. InProceedings of the ACM SIGCOMM
+2023 Conference (ACM SIGCOMM ’23). Association for Computing
+Machinery, New York, NY, USA, 816–831.https://doi.org/10.1145/
+3603269.3604849
+[64] Ultra Ethernet Consortium. 2025. Ultra Ethernet Specification Version
+1.0. (2025).https://ultraethernet.org/uec-1-0-specAccessed on August
+29, 2025.
+[65] Erico Vanini, Rong Pan, Mohammad Alizadeh, Parvin Taheri, and Tom
+Edsall. 2017. Let It Flow: Resilient Asymmetric Load Balancing with
+Flowlet Switching. In14th USENIX Symposium on Networked Systems
+Design and Implementation (NSDI 17). USENIX Association, Boston,
+MA, 407–420.https://www.usenix.org/conference/nsdi17/technical-
+sessions/presentation/vanini[66] Weitao Wang, Masoud Moshref, Yuliang Li, Gautam Kumar, T. S. Eu-
+gene Ng, Neal Cardwell, and Nandita Dukkipati. 2023. Poseidon: An Ef-
+ficient Congestion Control using Deployable INT for Data Center Net-
+works.https://www.usenix.org/system/files/nsdi23-wang-weitao.pdf
+[67] Jin Ye, Renzhang Liu, Ziqi Xie, Luting Feng, and Sen Liu. 2019. EMPTCP:
+An ECN Based Approach to Detect Shared Bottleneck in MPTCP. In
+2019 28th International Conference on Computer Communication and
+Networks (ICCCN). 1–10.https://doi.org/10.1109/ICCCN.2019.8847013
+[68] Hong Zhang, Junxue Zhang, Wei Bai, Kai Chen, and Mosharaf Chowd-
+hury. 2017. Resilient Datacenter Load Balancing in the Wild. InProceed-
+ings of the Conference of the ACM Special Interest Group on Data Com-
+munication (SIGCOMM ’17). Association for Computing Machinery,
+New York, NY, USA, 253–266.https://doi.org/10.1145/3098822.3098841
+[69] Jiao Zhang, Fengyuan Ren, and Chuang Lin. 2011. Modeling and
+understanding TCP incast in data center networks.2011 Proceedings
+IEEE INFOCOM(2011), 1377–1385.https://api.semanticscholar.org/
+CorpusID:16461175
+[70] Zhehui Zhang, Haiyang Zheng, Jiayao Hu, Xiangning Yu, Chenchen
+Qi, Xuemei Shi, and Guohui Wang. 2021. Hashing Linearity Enables
+Relative Path Control in Data Centers. In2021 USENIX Annual Techni-
+cal Conference (USENIX ATC 21). USENIX Association, 855–862.https:
+//www.usenix.org/conference/atc21/presentation/zhang-zhehui
+[71] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang,
+Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, et al .
+2023. Pytorch fsdp: experiences on scaling fully sharded data parallel.
+arXiv preprint arXiv:2304.11277(2023).
+[72] Junlan Zhou, Malveeka Tewari, Min Zhu, Abdul Kabbani, Leon
+Poutievski, Arjun Singh, and Amin Vahdat. 2014. WCMP: weighted
+cost multipathing for improved fairness in data centers. InProceedings
+of the Ninth European Conference on Computer Systems (EuroSys ’14).
+Association for Computing Machinery, New York, NY, USA, Article 5,
+14 pages.https://doi.org/10.1145/2592798.2592803
+[73] Yibo Zhu, Yibo Zhu, Haggai Eran, Daniel Firestone, Chuanxiong
+Guo, Marina Lipshteyn, Yehonatan Liron, Jitendra Padhye, Shachar
+Raindel, Mohamad Haj Yahia, Ming Zhang, and Jitu Padhye. 2015.
+Congestion Control for Large-Scale RDMA Deployments. InSIG-
+COMM(sigcomm ed.). ACM - Association for Computing Ma-
+chinery.https://www.microsoft.com/en-us/research/publication/
+congestion-control-for-large-scale-rdma-deployments/
+=== PAGE 18 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+A Freezing Mode in REPS
+Ideally, REPS should enter freezing mode only upon detecting
+a network failure. To achieve this, we employ two strategies:
+1.Packet Trimming Support: When packet trimming
+is available, distinguishing between packets lost due to
+congestion and those lost because of network failures
+becomes more straightforward. We use trimming to
+identify and separate lost packets with greater accu-
+racy.
+2.Absence of Packet Trimming: In the absence of
+packet trimming, we analyze the maximum round-
+trip time (RTT) observed during a period preceding
+the timeout event. If the maximum RTT immediately
+before the timeout is high, it indicates that the packet
+was likely lost due to congestion. Conversely, if the
+maximum RTT was low, the packet was more likely
+lost due to a network failure.
+In our paper, we focused on scenarios where packet trim-
+ming was not supported. However, REPS performs optimally
+when packet trimming is available, benefiting from both an
+enhanced loss detection algorithm and a more responsive
+CC loop.
+Regardless of the employed strategy, REPS maintains high
+performance even if it inadvertently enters freezing mode
+without an actual network failure. This is because entering
+freezing mode effectively reduces the EVS size of REPS. As
+demonstrated in Section 4.5.2, REPS remains effective with
+as few as 32 EVs. For instance, we tested REPS with the 16
+MiB permutation workload, running it first under normal
+conditions and then with forced freezing mode activated
+after50𝜇s. The results show comparable results for REPS
+with or without forcing the freezing mode, as illustrated in
+Figure 19 with only minor instability introduced by activat-
+ing freezing mode. However, compared to OPS, REPS with
+the force freezing mode is still significantly more stable and
+has a finishing time comparable to the standard REPS, both
+completing the workload slightly faster than OPS.
+As an extension of REPS, probing can be incorporated to
+enhance failure detection precision. However, we chose not
+to integrate this into REPS at this stage to maintain clarity
+and focus on the core framework. We also do not discuss fast
+loss-recovery mechanisms as they are anyway orthogonal
+to REPS behaviour and could be used to further improve its
+performance.
+B REPS Single Switch Convergence Proof
+We prove the main theorem that demonstrates the conver-
+gence of the recycled balls-into-bins process for a single
+switch.
+The process has two distinct phases. In the first phase,
+there are still empty bins. The number of balls can still grow
+in this ’warmup’ phase. We will bound the steps it takes
+to undergo the first phase and bound the maximum load.
+0 50 100 150 200 250 300 350200400Oblivious Packet Spraying
+0100200300
+0100200300
+01002003000 50 100 150 200 250 300 3500200400REPS
+0 50 100 150 200 250 300 350
+Time (microseconds)0200400REPS force Freezing after 50µs
+Queue Size (KB)Output Port Utilization (Gbps)KMax
+KMaxKMax
+KMin
+KMinKMinQueues
+Ports
+Utilization
+Freezing 
+startsFigure 19.Studying REPS while forcing freezing mode after
+a fixed period of time.
+In the second phase, all bins are non-empty. Once a bin is
+non-empty, it remains non-empty. Moreover, once all bins
+are non-empty, the number of balls in the system remains
+constant, as for every ball removed a ball is thrown. In this
+second phase, we will show that the system converges to a
+state where all bins have at most 𝜏balls by means of a drift
+theorem [ 41]. Note that once all bins have at most 𝜏balls and
+every ball has a distinct color, they will keep having at most
+𝜏balls. Moreover, we will argue about the maximum load
+and we will show that throughout, as long as the number of
+colors is at least 𝑏·𝑛≥( 2.4ln𝑛)𝑛 , there is at most one ball
+of any given color with high probability.
+Note that much of the proof is devoted to showing con-
+vergence of the second phase. If we set the threshold large
+enough, no bin ever overflows and essentially we only have
+the first phase, which converges in expected 𝑛ln𝑛+𝑛 steps.
+Since queues are an expensive hardware resource, we are
+interested in showing good constant factor bounds for the
+queue lengths rather than giving a weaker asymptotic bound
+for𝜏.
+Proof of Theorem 5.1. First Phase.We say a ball is fresh if
+it was thrown randomly. After 𝑚= 2𝑛ln𝑛 fresh balls are
+thrown, every bin received at least one fresh ball with proba-
+bility1−1
+𝑛, by the coupon collector problem [ 21]. Either all
+bins are non-empty before 𝑚steps and we are done, or we
+have thrown at least 𝑚fresh balls and all bins are non-empty.
+Either way, a bin receives at most 𝑂(log𝑛) fresh balls, by
+balls into bins with 𝑚+𝑛 balls [ 56]. Observe that the number
+of balls in a bin only increases if it receives a fresh ball. Hence,
+=== PAGE 19 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+the number of received fresh balls bounds the number of
+balls in a bin.
+Since𝑏>2.4ln𝑛, we have at most one ball per color when
+the first phase ends.
+Second PhaseAt the beginning of the second phase,
+we have at most2 𝑛ln𝑛+𝑛 balls in total and all bins are
+nonempty. We define a potential function to measure the drift
+towards a completely load-balanced state. Let 𝑋𝑖
+𝑡be the num-
+ber of balls in bin 𝑖at time step 𝑡and let𝑌𝑖
+𝑡=max( 0,𝑋𝑖
+𝑡−𝜏).
+Our potential is 𝑌𝑡=Í
+𝑖𝑌𝑖
+𝑡. Clearly, when the potential is0,
+all bins have at most 𝜏elements. We need to bound the drift
+𝑌𝑡+1−𝑌𝑡.
+We first consider the case where each ball has a unique
+color. The drift depends on the number of bins with more
+than𝜏elements, which we denote by 𝐾𝑡. Let us consider the
+expected drift for one particular bin𝑖. The easy cases are:
+𝐸[𝑌𝑖
+𝑡+1−𝑌𝑖
+𝑡|𝑋𝑖
+𝑡=𝑥,𝐾 𝑡=𝑘]= 
+𝑘
+𝑛−1if𝑥>𝜏,
+𝑘
+𝑛if𝑥=𝜏
+0if𝑥≤𝜏−𝑘,
+If𝑥is in between 𝜏−𝑘 and𝜏, it gets interesting. The ex-
+pected drift is still bounded by𝑛
+𝑘, but this estimate is not
+strong enough overall. Instead, we need to show that the
+expected drift is very small for all such bins. To this end, we
+express the expected drift using a binomial random variable
+𝐵with parameters1
+𝑛and𝑘as𝐸[max( 0,𝐵−(𝜏−𝑥))] . We
+cannot directly use linearity of expectation because of the
+maximum function. Instead, using total expectation leads to
+the following expression (for𝑧≥3):
+𝐸[max(0,𝐵−𝑧)]= (𝐸[𝐵|𝐵≥𝑧]−𝑧)𝑃[𝐵≥𝑧]
+≤1
+𝑧−1𝑒−(𝑧−1),
+where we show the tail bound in Lemma B.2.
+We now compute the expected drift overall by considering
+each type of bin separately. By summing over all bins, the
+total expected drift contribution of bins with less than 𝜏−ln𝑛
+balls is therefore bounded by1
+ln𝑛(since𝑧≥ln𝑛+ 1). Note
+that these bins only contribute to the drift if 𝑘>ln𝑛 . Next,
+consider the contribution from bins with at least 𝜏−ln𝑛 but
+at most𝜏balls. Since we have at most2 𝑛log𝑛+𝑛 balls, of
+which at least 𝑘(𝜏+ 1)balls are in overfull bins, there can
+be at most2𝑛log𝑛+𝑛−𝑘(𝜏+1)
+𝜏−ln𝑛≤3
+4𝑛−𝑘 such bins. They each
+contribute at most𝑘
+𝑛, so their total contribution is at most
+3
+4𝑘−𝑘2
+𝑛. Finally, each overfull bin contributes𝑘
+𝑛−1to the
+expectation, for a total contribution of𝑘2
+𝑛−𝑘. Hence, the
+total expected drift is
+𝐸[𝑌 𝑡+1−𝑌𝑡|𝐾𝑡=𝑘]≤(
+1
+ln𝑛−𝑘
+4if𝑘>ln𝑛,
+−1
+4else.
+Next, we bound the expected drift when there is more
+than one ball per color. We have two balls of the same color
+only if a ball does not get removed before the next ball ofthe same color is thrown. This happens if more than 𝑏balls
+arrive in the same bin in the same time step as the ball (this
+uses the FiFO-property of the queues). By a tail bound on the
+binomial distribution, this happens with probability at most
+𝑒5/4
+𝑛3, by Lemma B.1 using 𝑏≥12
+5ln𝑛. By a union bound, the
+probability thatanycolor in a batch has more than one ball
+is at most𝑒5/4
+𝑛2. The drift is bounded by 𝑛, so the contribution
+to the expected drift by this case is at most𝑒5/4
+𝑛.
+Note that for 𝑛≥ 16,𝑒5/4
+𝑛+1
+ln𝑛−1+ln𝑛
+4≥−1
+8and𝑒5/4
+𝑛−
+1
+4≥ −1
+32. Hence, the expected drift is at most −1
+32. We
+conclude by an additive drift theorem [ 29,41] that the ex-
+pected time until all bins are below the threshold is at most
+𝐸[32·𝑌0]=𝑂(𝑛ln𝑛) . If all balls have unique colors at the
+end, the process converges then. This happens with prob-
+ability1−𝑂(ln𝑛
+𝑛). So with high probability, a single such
+𝑌𝑡=0event suffices and the overall expectation is 𝑂(𝑛ln𝑛) .
+Observe that the number of balls in the queues is bounded
+by𝜏plus the maximum load of a batched balls-into-bins
+process [ 11] with expected injection rate 𝜆=𝑘
+𝑛≤1
+2. Hence,
+the number of balls in a bin is 𝑂(log𝑛) throughout with high
+probability.
+□
+We use the following tail bound:
+Lemma B.1.Let 𝐵be binomially distributed with parameters
+1
+𝑛and𝑘≤𝑛. Then, for any𝑥≥16:
+𝑃[𝐵≥𝑥]≤𝑒−5
+4(𝑥−1)
+Proof.We use an additive Chernoff bound [16]:
+𝑃[𝐵≥𝐸[𝐵]+𝛿]≤𝑒−𝛿2
+2(𝐸[𝐵]+𝛿/3)
+≤𝑒−𝛿
+2
+𝛿+2
+3
+≤𝑒−5
+4𝛿using𝛿≥15
+□
+We use the following lemma to bound the expected drift
+of bins that are far below the threshold:
+Lemma B.2.Let 𝐵be binomially distributed with parameters
+1
+𝑛and𝑘≤𝑛/2. Then, for any𝑥≥7/2:
+(𝐸[𝐵|𝐵≥𝑥]−𝑥)𝑃[𝐵≥𝑥]≤1
+𝑥−1𝑒−(𝑥−1
+2)
+Proof. We use a bound from Pelekis [ 52] for𝐸[𝐵|𝐵≥𝑥].
+By their theorem on this conditional expectation:
+𝐸[𝐵|𝐵≥𝑥]≤𝑥+(𝑛−𝑥)1
+𝑛
+𝑥−𝑘
+𝑛+1
+𝑛≤𝑥+1
+𝑥−1.
+=== PAGE 20 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+We bound𝑃[𝐵≥𝑥]similarly as in Lemma B.1:
+𝑃[𝐵≥𝐸[𝐵]+𝛿]≤𝑒−𝛿2
+2(𝐸[𝐵]+𝛿/3)
+≤𝑒−𝛿
+1
+𝛿+2
+3 using𝐸[𝐵]≤1
+2
+≤𝑒−𝛿using𝛿≥3
+Because𝐸[𝐵]≤1
+2,𝑃[𝐵≥𝑥]≤𝑒−(𝑥−1
+2).□
+C Additional Results
+This section presents additional results that could not be
+included in the main body of the paper.
+C.1 ACK Coalescing Theoretical Modeling
+To assess REPS performance under different ACK coalesc-
+ing ratios, we validate it using the theoretical model from
+Section 5.1.
+0 500 1000 1500 2000050Recycled Ball every 2 ACKs
+0 500 1000 1500 2000050Recycled Ball every 4 ACKs
+0 500 1000 1500 2000
+Balls-into-bins Round050Recycled Ball every 8 ACKsQueue Size (Pkts)OPS
+Recycled 
+Balls
+τττ
+Figure 20.Performance with different ACK coalescing ratios
+using the balls-into-bins models.
+Figure 20 shows how the recycled balls model performs
+well, even with less frequent recycling. While we lose the
+guarantee of consistently staying below 𝜏, with 2:1 and 4:1
+recycling ratios, the queues barely exceed this threshold. An
+8:1 ratio still proves slightly more advantageous than OPS.
+C.2 Different Tiers
+We aim to verify that REPS performs effectively with fat-tree
+topologies that have three tiers. This scenario poses a slightly
+greater challenge for REPS, as a single EV must manage two
+hops. Nonetheless, there is no intrinsic reason why REPS
+should not perform well in such a topology.
+To validate this, we execute the synthetic benchmark us-
+ing the symmetric topology described in Section 4.3.1, butwith three tiers instead of two. The results, shown in Fig-
+ure 21, indicate that REPS performs comparably to the two-
+tier topology.
+1 2 3 4 5
+Speedup vs ECMPI. 8:1 4MiB
+I. 8:1 8MiB
+I. 8:1 16MiB
+P. 4MiB
+P. 8MiB
+P. 16MiB
+T. 4MiB
+T. 8MiB
+T. 16MiBSynthetic Benchmarks
+ECMP
+OPSFlowlet
+BitMapMPRDMA
+PLBMPTCP
+Adaptive RoCEREPS
+Figure 21.Studying REPS with a 3 tiers fat tree topology.
+C.3 Incremental Failures
+To further demonstrate the resilience of REPS under fail-
+ures, we conducted an experiment where we incrementally
+failed all but one of a switch’s uplinks at 200µs intervals.
+Figure 22 presents the permutation from the perspective of
+the failing switch, where three of the four uplinks were per-
+manently disabled in a staggered manner. As expected, REPS
+enters freezing mode immediately after the first failure, en-
+suring that failing output ports are avoided. Notably, small
+utilization spikes are observed on the failing links when
+REPS exits freezing mode to verify if the failure has been
+resolved. Since the failures are permanent for the duration
+of the experiment, REPS promptly re-enters freezing mode
+after detecting unresolved issues.
+In this drastic scenario, OPS performs 40×worse than
+REPS, primarily due to its inability to avoid broken links, re-
+sulting in numerous retransmissions and reduced congestion
+windows.
+C.4 Impact of Freezing Mode
+To demonstrate the impact of having freezing mode in REPS,
+we evaluate three different scenarios with and without freez-
+ing mode. In Figure 23, we show the effect of having freezing
+mode available versus disabling it. As expected, in scenarios
+without failures, REPS performs the same with or without
+freezing mode. However, when adding failures in the form
+of 1% cables failure, we can see freezing mode helping, with
+almost a 25% gain over not having it. However, we highlight
+that REPS remains competitive even when running without
+freezing mode. This could be used to simplify deployments
+if needed.
+=== PAGE 21 ===
+REPS: R ecycled E ntropy P acket S praying
+for Adaptive Load Balancing and Failure Mitigation EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk
+0100200300
+01002003000 20000 40000 60000 800000100200300400Oblivious Packet Spraying
+0 250 500 750 1000 1250 1500 1750
+Time (microseconds)0100200300400REPS
+Queue Size (KB)Output Port Utilization (Gbps)Failure
+1 startsFailure
+2 startsFailure
+3 starts
+Freezing 
+startsREPS occasionally exits
+freezing to check the failure
+status before re-entering it right away.OPS performs very poorly as continuous 
+timeouts and retransmissions drastically
+slow its sending rate.
+Figure 22.REPS vs. OPS in a 32 MiB permutation with
+incremental persistent failures.
+Symmetric
+No FailuresAsymmetric
+No FailuresSymmetric
+With Failures0100200300400Max FCT (μs)REPS REPS no freezing OPS
+Figure 23.Impact on runtime of disabling freezing mode in
+REPS.
+D Additional Data
+The datacenter traces used throughout this paper have been
+previously used in a number of similar works [ 6,65]. In
+particular we use traces provided by Facebook and a series
+of traces used for web search in production clusters. The
+CDF distribution for such traces can be seen in Figure 24. For
+most of the paper we focus exclusively on the WebSearch
+traces.
+102103104105106107
+Message Size (B)0.00.20.40.60.81.0CDFFacebook
+WebSearch
+Figure 24.CDF for different data center traces
+=== PAGE 22 ===
+EUROSYS ’26, April 27–30, 2026, Edinburgh, Scotland Uk Bonato et al.
+E Artifact Appendix
+E.1 Abstract
+This appendix provides concise instructions for installing
+and executing the REPS artifact. Each figure is generated by
+a dedicated Python script to ensure reproducibility. We also
+include Bash scripts to run the full experiment suite or any
+user-selected subset. Note that the AD was prepared earlier
+than the camera-ready paper, so some figure numbers may
+mismatch the camera-ready version.
+E.2 Description & Requirements
+E.2.1 How to access.We provide a link to a GitHub repos-
+itory and a link to a Zenodo DOI:
+•GitHub:https://github.com/tommasobo/REPS_EuroSys_
+Artifact
+•Zenodo:https://doi.org/10.5281/zenodo.17054005
+In the content of the repository we also offer instructions
+inside theREADME.
+E.2.2 Hardware dependencies.No specialized hardware
+is required. All experiments were performed on a commodity
+x86 CPU. Any similar processor capable of running the sim-
+ulator should suffice to reproduce the results. For our runs
+we used 40GB of RAM, but we expect the simulations to run
+also with 32GB of RAM. 16GB of RAM might also work but
+might require lowering the number of parallel simulations.
+E.2.3 Software dependencies.The artifact requires C++17
+and Python3.8 as the minimum dependencies for build-
+ing and running both the htsim simulator and the relative
+Python scripts. All experiments and computational artifacts
+in this paper were run locally on Ubuntu 22.04 LTS using
+WSL 2.
+To process and visualize the raw data, we rely on a set of
+standard Python packages,i.e., seaborn ,scipy ,numpy , and
+pandas . We do provide a requirements.txt that users can
+use to install all needed Python dependencies.
+E.2.4 Benchmarks.All the benchmarks are self contained
+and do not depend on external data.
+E.3 Set-up
+After obtaining the source code, either via git clone or by
+downloading and extracting the Zenodo archive, install the
+required packages by running:
+•./reps_pkg_install.sh
+If you encounter errors or want to avoid conflicts with
+local packages, run these commands inside a clean Python
+environment created withvenv. For example:
+•python3 -m venv .venv
+•source .venv/bin/activate
+Then, from the ./htsim/sim directory, install htsim with:
+•make clean && cd datacenter/ && make clean &&cd .. && make -j 8 && cd datacenter/ && make -j 8 &&
+cd ..
+E.4 Evaluation workflow
+E.4.1 Major Claims.Our main claim of the paper is that:
+•(C1): REPS consistently matches or exceeds the perfor-
+mance of modern load-balancing schemes. On symmetric
+networks, it always slightly outperforms OPS; under fail-
+ures or asymmetric conditions, it delivers clear gains
+over OPS and other adaptive approaches.
+E.4.2 Experiments.Please note that minor discrepancies
+from the submitted version may occur due to hardware or
+software differences and inherent randomness, despite our
+efforts to fix all random seeds. Additionally, some plots were
+manually annotated and enhanced during post-processing.
+However, for most figures we expect an exact match. With
+that in mind, running and analyzing the code is straightfor-
+ward and explained in the next paragraph.
+[Execution]We provide in the /artifact_scripts folder,
+a number of Python scripts that will run the code needed
+for their respective figures. For example, to generate Figure
+1, one must run the fig_1_symmetric_micro.py Python
+script.
+To facilitate the process, we provide three Bash scripts
+that can run most or all experiments needed to reproduce
+the results of the paper. In particular:
+•reps_quick.sh : runs quickly (less than 2 hours) and
+generates a small subset of Figures.
+•reps_medium.sh : runs in about 6 hours and generates
+almost all Figures of the paper.
+•reps_full.sh : runs all experiments in the paper and
+may take up to a day.
+Exact running times depend on hardware performance.
+[Results]Once experiments are run, results are automatically
+generated in the artifact_results/ directory. Within this
+directory, each experiment has its own subfolder containing
+the plots and, when applicable, theraw_data/.
+For instance, to visualize the first Figure, one must navi-
+gate to artifact_results/fig_1_symmetric_micro/plots
+and open its contents. In most cases we provide the plots in
+both.pdfand.pngformat.
