@@ -82,6 +82,7 @@ MRC 多路径传输协议+多平面拓扑+SRv6 静态源路由，构建 10 万+ 
 - **换路机制**：拥塞→SKIP（临时跳过自动恢复）；故障→ASSUMED_BAD（立即停用+备用 EV 替换，须同平面）；后台 probe 验证，成功则 resurrected
 - **EV 状态机**：GOOD ↔ SKIP（拥塞）→ ASSUMED_BAD（故障+探测恢复）；DENIED 为控制面显式禁用；EV 更新后 SRv6 地址算法重算，无需路由操作
 - **丢包识别**：SACK bitmap 空洞=疑似（可能乱序在途）→ local ACK timeout 到期=确认丢失→重传（带 rtx 标志）；TRIMMED NACK=免等待快速重传。超时重传 ≠ 故障丢包（还可能是拥塞无 trim、bit error、反向 SACK 丢失、接收端资源不足），故障判定靠 probe 验证的"假设-验证-恢复"循环
+- **丢包→停用哪个 EV（PSN→EV 关联）**：论文只写了结论"stops using the corresponding EV"，未写实现细节。规范依据分散三处：①§9.3.2 发送端 MUST 能将控制响应关联到所用平面，常见做法=**在 outstanding packet 元数据中记录 transmit plane**（implementation-defined）；②§7.4.1/§7.4.7 发送端维护 per-PSN outstanding 跟踪（Local ACK Timeout、PSN[15:0] 标记请求）→ 附记 EV 只是多几个 bit；③§7.1/§9.3.1 SACK/NACK 回传触发包 EV 的目的就是让发送端按路径（EV）感知拥塞/故障（"detect paths that have failed"）。"PSN→EV 映射表"是协议必然性推论而非论文陈述，具体数据结构由厂商 NIC 实现决定
 
 ## 3. 运维实践（§3）
 
