@@ -1,0 +1,2606 @@
+===== PAGE 1 =====
+DynamiQ: Accelerating Gradient Synchronization using
+Compressed Multi-hop All-reduce
+Wenchen Han
+University College London
+Shay Vargaftik
+VMware Research by Broadcom
+Michael Mitzenmacher
+Harvard University
+Ran Ben Basat
+University College London and Broadcom
+Abstract
+Multi-hop all-reduce is the de facto backbone of large model train-
+ing. As the training scale increases, the network often becomes
+a bottleneck, motivating the reduction of the volume of transmit-
+ted data. Accordingly, recent systems have demonstrated signif-
+icant acceleration of the training process using gradient quanti-
+zation. However, these systems are not optimized for multi-hop
+aggregation, where entries are partially summed multiple times
+along their aggregation topology.
+We present DynamiQ, a quantization framework that bridges
+the gap between quantization best practices and multi-hop aggrega-
+tion. DynamiQ introduces novel techniques to better represent par-
+tial sums, co-designed with a decompress-accumulate-recompress
+fused kernel to facilitate fast execution.
+We extend PyTorch DDP to support DynamiQ over NCCL P2P,
+and across different LLMs, tasks, and scales, we demonstrate consis-
+tent improvement of up to 34.2% over the best among state-of-the-
+art methods such as Omni-Reduce, THC, and emerging standards
+such as MXFP4, MXFP6, and MXFP8. Further, DynamiQ is the only
+evaluated method that consistently reaches near-baseline accuracy
+(e.g., 99.9% of the BF16 baseline) and does so while significantly
+accelerating the training.
+CCS Concepts
+• Computer systems organization →Distributed architec-
+tures; • Computing methodologies →Machine learning.
+Keywords
+Distributed training, all-reduce, gradient compression, quantization,
+algorithms, data-parallelism, large language models
+ACM Reference Format:
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat.
+2026. DynamiQ: Accelerating Gradient Synchronization using Compressed
+Multi-hop All-reduce. In ACM SIGCOMM 2026 Conference (SIGCOMM ’26),
+August 17–21, 2026, Denver, CO, USA. ACM, New York, NY, USA, 17 pages.
+https://doi.org/10.1145/3789240.3829148
+SIGCOMM ’26, Denver, CO, USA
+© 2026 Copyright held by the owner/author(s).
+This is the author’s version of the work. It is posted here for your personal use. Not
+for redistribution. The definitive Version of Record was published in ACM SIGCOMM
+2026 Conference (SIGCOMM ’26), August 17–21, 2026, Denver, CO, USA, https://doi.org/
+10.1145/3789240.3829148.
+1
+Introduction
+Distributed data parallel (DDP) [30] is the standard paradigm for
+large language model (LLM) training and fine-tuning. Under this
+paradigm, the model is replicated across workers, each process-
+ing a different part of the data to compute a local gradient. These
+gradients are then synchronized (aggregated) via the network to
+obtain a global update. Gradient aggregation in LLM training com-
+monly relies on multi-hop all-reduce schemes [4, 8, 57], such as
+ring [1] and butterfly [78]. With the growth of model sizes and
+the number of workers, gradient aggregation increasingly becomes
+a bottleneck [39, 71, 72, 76, 88, 89]. Recent practices of running
+multiple jobs in the same cluster, where jobs compete on network
+resources [25, 46], further intensify the bottleneck.
+Gradient compression, which aims to reduce the volume of com-
+municated gradient data, is therefore a natural and promising ap-
+proach to accelerating gradient aggregation. Despite substantial
+prior work, we observe that state-of-the-art solutions [17, 36, 56, 68,
+86, 87] typically consider the (single-hop) parameter-server architec-
+ture [55] where aggregation (after decompression) can be performed
+with higher precision without any bandwidth implications. In par-
+ticular, they are not optimized for multihop all-reduce, where gradi-
+ents are partially summed along their aggregation topology. In such
+a scheme, intermediate nodes face the choice of either recompress-
+ing the partial sum, thus degrading accuracy and eventually model
+performance, or increasing the number of bits used for its represen-
+tation, leading to limited end-to-end speedups [15, 42]. As we show
+in Section 5, this limitation applies both to existing quantization and
+sparsification schemes (e.g., THC [56] and OmniReduce [36]), as
+well as recent microscaling floating-point (FP) formats [7, 68, 70].
+In this paper, we focus on data-parallelism and introduce Dy-
+namiQ, a compression framework tailored for multi-hop all-reduce
+and is applicable to both pre-training and fine-tuning. DynamiQ
+minimizes the compression error of partial sums under a bandwidth
+constraint, utilizing a fused decompress– accumulate–recompress
+kernel to minimize memory bandwidth [3, 5, 85] and facilitate
+the overlap of compression with communication. The key to Dy-
+namiQ’s superior accuracy-bandwidth tradeoff lies in its two-phase
+method of quantizing different coordinates with different numbers
+of bits, depending on their magnitude in the aggregated gradient.
+Ideally, we would quantize each coordinate with a number of bits
+based on its magnitude. However, this imposes several challenges:
+• Communicating each entry’s quantized bit width would add
+prohibitive overhead.
+• Arbitrary quantized widths can break byte alignment, prevent-
+ing efficient fused kernels.
+arXiv:2602.08923v3  [cs.LG]  7 Jul 2026
+
+===== PAGE 2 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+• Aperiodic widths harm memory coalescing. Moreover, offset
+metadata also significantly increases the memory and band-
+width overheads.
+• Varying the bit allocation along the aggregation path requires
+repacking and hinders performance, as this cannot be done
+efficiently in a fused kernel.
+Instead, our framework works as follows. DynamiQ joins con-
+secutive entries into small groups (e.g., 16 entries), which are then
+further formed into super-groups (e.g., 16 groups). Groups and super-
+groups share metadata; groups have a shared scale parameter, and
+all entries in a super-group use the same bitwidth. This approach
+provides a good balance between bit allocation flexibility (from
+varying the group size) and metadata overhead. DynamiQ performs
+an initial lightweight all-reduce call to collect necessary statistics
+about super-groups. This enables all workers to agree on the bit
+allocation, which then remains fixed throughout the aggregation.
+Further, all workers then reorder the super-groups according to
+their bit allocation, which enables fused kernel invocations on se-
+quential data in the main all-reduce.
+To further optimize the bandwidth-accuracy tradeoff, DynamiQ
+uses advanced quantization techniques, including:
+• Non-uniform quantization — DynamiQ normalizes the data and
+uses a pre-determined non-uniform set of quantization values
+that optimizes the per-entry multiplicative error. Intuitively, this
+is achieved by using more quantization values that are closer to
+zero than larger ones, akin to floating-point formats. Specifically,
+we use the choice of quantization values proposed by [34].
+• Negative correlation across workers — DynamiQ uses correlated
+rounding so the errors are more likely cancel out [75]. Intuitively,
+DynamiQ uses shared randomness to increase the probability
+that if one worker rounds upwards, another will round down,
+lowering the aggregation error.
+We integrate DynamiQ into PyTorch DDP [57] via a commu-
+nication hook that runs over NCCL P2P [11]. We evaluate DynamiQ
+across different LLM fine-tuning workloads (BERT-large [31] Masked
+LM, LLaMA-1B [35] chat & MMLU [44], Gemma-1B [77] Chat)
+and all-reduce topologies (ring and butterfly). DynamiQ improves
+the time-to-accuracy by up to 34.2% over the best among Om-
+niReduce [36], THC [56] and modern floating point (FP) formats
+(MXFP4/MXFP6/MXFP8) [7]. In several settings, DynamiQ is the
+only method that reaches near-baseline accuracy (i.e., 99.9% final
+accuracy relative to BF16) in all our workloads while accelerating
+training by 40.8% compared with BF16. In simulated setups, we
+show that DynamiQ scales well to large DP-dimensions. For exam-
+ple, with a DP-dimension of 8192, DynamiQ with ¯𝑏= 6 bits per
+coordinate is more accurate than MXFP8 (¯𝑏= 8.5 per coordinate)
+by a large margin. Our code is available at [41].
+2
+Background
+In this section, we provide necessary background on quantiza-
+tion. Quantization is the process of mapping a continuous or high-
+precision set of values to a smaller, discrete set of values, essentially
+reducing the number of bits used to represent a number. In the
+context of distributed gradient-based training frameworks (e.g.,
+using a distributed SGD, ADAM [51], or AdamW [59] for LLMs),
+at each training round, gradients from different workers must be
+aggregated to compute a global gradient. Thus, employing gradient
+quantization at the workers reduces communication. The challenge,
+however, is to make the quantization accurate and fast, so that it
+takes less time to reach the desired model accuracy, a metric known
+to time-to-accuracy.
+2.1
+Unbiased quantization
+An important property of gradient quantization is being unbiased.
+Namely, given a gradient 𝑋∈R𝑑and its quantized estimate b𝑋, we
+would like to have E[b𝑋] = 𝑋.
+Intuitively, unbiasedness is desirable when averaging, as when
+some values are rounded up and others are rounded down, the
+errors cancel out in expectation. Critically, under mild conditions,
+unbiased quantization ensures training convergence [16].
+A fundamental method for unbiased quantization is stochastic
+quantization (SQ). In SQ, given a scalar 𝑥∈R and two quantization
+values 𝑥↓,𝑥↑where 𝑥∈[𝑥↓,𝑥↑], we obtain E[b𝑥] = 𝑥by setting
+b𝑥=
+
+
+𝑥↑
+w.p. 𝑥−𝑥↓
+𝑥↑−𝑥↓
+𝑥↓
+otherwise
+.
+More generally, when quantizing a vector 𝑋∈R𝑑using a set
+of quantization values 𝑄⊂R𝑑, for each 𝑥∈𝑋, we denote by 𝑥↓=
+max {𝑞∈𝑄| 𝑞≤𝑥} and 𝑥↑= min {𝑞∈𝑄| 𝑞≥𝑥} its two closest
+values, and apply SQ as described above. Thus, each quantized value
+b𝑥∈𝑄can be represented using log2 |𝑄| bits using its quantization
+value index (e.g., for 4 bits per coordinate, we can use |𝑄| = 16).
+2.2
+Grouped quantization
+To dequantize a quantized vector, the receiver must know the set 𝑄.
+While many previous works select a single𝑄for an entire all-reduce
+call, we opt to choose one set for each group (a consecutive sequence
+of e.g., 16 entries) as it allows optimizing 𝑄for the specific entries.
+There are two main reasons why a per-group choice of 𝑄is more
+accurate. First, gradients often exhibit spatial locality, where nearby
+entries tend to have similar magnitudes. Grouping, therefore, tailors
+𝑄to a small range of values. Second, the gradient distribution itself
+is skewed, with a small number of coordinates (outliers) that can
+be orders of magnitude larger than others. These outliers have a
+disproportionate effect on the set 𝑄and the effectiveness of quan-
+tization. Using per-group values 𝑄with small groups reduces the
+overall effect of these outliers.
+Intuitively, due to the above reasons, the smaller the groups are,
+the more accurate the quantization is, as we tailor 𝑄(and the size of
+𝑄) for each specific group. However, since each group has an over-
+head (i.e., the encoding of its 𝑄), having too many small groups in-
+flates the required bandwidth, defeating the purpose of quantization.
+To reduce the encoding overheads, one can use super-groups (e.g.,
+of 16 consecutive groups each) to share some of the metadata [9].
+We conduct an experiment to exemplify spatial locality and
+skewness. To do so, we compare the distribution of group and
+super-group norms in the original gradient to these distributions
+after randomly shuffling the entries. Intuitively, if there is no spa-
+tial locality, the distributions are likely to be similar. We analyze
+the first gradient of fine-tuning LLaMA 1B for MMLU [44] and
+Gemma 1B for Ultrachat [32] (the complete experimental details
+appear in Section 5). We show the results for groups of size 16 in
+
+===== PAGE 3 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+ℓ2 norm per group
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+Original
+Shuffled
+10−9 10−7 10−5 10−3 10−1 101
+(a) LLaMA, group size 16
+ℓ2 norm per group
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+Original
+Shuffled
+10−9 10−7 10−5 10−3 10−1 101
+(b) Gemma, group size 16
+ℓ2 norm per super-group
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+Original
+Shuffled
+10−9 10−7 10−5 10−3 10−1 101
+(c) LLaMA, super-group size 256
+ℓ2 norm per super-group
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+Original
+Shuffled
+10−9 10−7 10−5 10−3 10−1 101
+(d) Gemma, super-group size 256
+Figure 1: ℓ2 norm distributions of the gradients and their random
+shuffle for groups of size 16 and super-groups of size 256. The detailed
+experimental setups appear in Section 5.
+Figures 1(a)-1(b) and for a sequence of 16 groups (i.e., super-groups)
+in Figures 1(c)-1(d). This spatial locality yields a significant fraction
+(e.g., about 20% in LLaMA and 30% in Gemma) of super-groups
+with a norm that is orders of magnitude smaller than the median,
+highlighting the opportunity for variable bitwidth allocation.
+2.3
+Non-uniform quantization
+Given an input 𝑋∈R𝑑, the common choice of 𝑄is to place |𝑄|
+uniformly spaced quantization values in the range [min𝑋, max𝑋]
+(e.g., QSGD [16] and Uniform-THC [56]). To optimize the accuracy
+for |𝑄| quantization values, we can place them non-uniformly.
+For example, consider 𝑋= (−1, 1/2, 1); if we want |𝑄| = 3,
+uniform SQ would use 𝑄= {−1, 0, 1} resulting in a Mean Squared
+Error (MSE) of Í
+𝑥∈𝑋E[(b𝑥−𝑥)2] = 1/4. In contrast, picking the
+non-uniform 𝑄= {−1, 1/2, 1} results in an MSE of 0. Generally,
+the MSE of non-uniform SQ can be asymptotically lower, e.g., for
+𝑋= (−1, 1/2, . . . , 1/2, 1), i.e., where 1/2 repeats𝑑−2 times. Here, the
+MSE of uniform SQ is Ω(𝑑) while the non-uniform SQ is accurate.
+2.4
+Negative correlation
+Intuitively, we can take the idea of unbiased quantization a step
+forward by explicitly ‘encouraging’ errors to cancel out [75]. This
+is achieved by using shared randomness between different work-
+ers, which is facilitated by them sharing a peudo-random number
+generator seed. Using shared randomness is a common practice in
+quantization works (e.g., [18–22]).
+For example, consider the simple case where two workers hold
+numbers 𝑥1,𝑥2 ∈[0, 1] that need to be quantized into 1 bit each,
+with the goal of estimating 𝑥1 + 𝑥2. A standard approach is to have
+independent randomness where workers generate uniform random
+variables 𝑢1,𝑢2 ∼U[0, 1] and quantize
+b
+𝑥1 =
+(
+1
+if 𝑢1 ≤𝑥1
+0
+otherwise
+,
+b
+𝑥2 =
+(
+1
+if 𝑢2 ≤𝑥2
+0
+otherwise .
+To leverage negative correlation, we use the shared randomness to
+set 𝑢2 = 1 −𝑢1; i.e., both workers generate the same 𝑢1 ∼U[0, 1]
+but use it in a different way to increase the chances that they
+round in the opposite direction. For example, if 𝑥1 = 𝑥2 = 1/2, the
+independent randomness variance is Var[b𝑥1 + b𝑥2] = 1/2 while the
+negative correlation’s variance is 0. More generally, the variance
+(for any input 𝑥1,𝑥2) of the negative correlation approach is at most
+1/4, i.e., improving the worst-case variance by a factor of 2.
+3
+The DynamiQ Framework
+Figure 2 illustrates an overview of the framework.
+In the first stage, each worker partitions the gradient into super-
+groups of 𝑆entries, and computes the metadata per super-group
+(Fig. 2(a)). Next, this local metadata is aggregated by an initial all-
+reduce call (Fig. 2(b)) that is lightweight since it contains only the
+super-group means and sum of ℓ2 norms, so the volume typically
+less than 1% of the original gradient. We then perform per-super-
+group normalization and allocate variable bitwidths for different
+super-groups. We reorder the gradient such that super-groups with
+the same bitwidth appear consecutively (Fig. 2(c)), and perform the
+main all-reduce (Figs. 2(d) and 2(e)). Finally, we post-process the
+aggregated data by reordering the super-groups to their original
+position and adding their mean value back to obtain the synced
+gradient (Fig. 2(f)). We also propose and adopt several techniques to
+reduce the compression error and implement our algorithm using
+fused kernels to minimize the computational overhead.
+3.1
+Obtaining super-group statistics
+We formalize the first two stages (Fig. 2(a) and Fig. 2(b)). Assume a
+setup with 𝑛workers. Let 𝑋𝑖,𝑗be the 𝑗’th super-group of worker 𝑖.
+For each 𝑖, 𝑗, the 𝑖’th worker first computes the mean given by 𝜇𝑖,𝑗=
+Í
+𝑥∈𝑋𝑖,𝑗𝑥/|𝑋𝑖,𝑗| and squared ℓ2 norm given by 𝐹𝑖,𝑗= Í
+𝑥∈𝑋𝑖,𝑗𝑥2.
+DynamiQ then uses an initial all-reduce stage to aggregate these
+values. At the end of this stage, for each super-group 𝑗, all workers
+have the global mean 𝜇𝑗and sum-of-squared-norms 𝐹𝑗for that
+super-group. Formally,
+𝜇𝑗= 1
+𝑛·
+𝑛
+∑︁
+𝑖=1
+𝜇𝑖,𝑗
+,
+𝐹𝑗=
+𝑛
+∑︁
+𝑖=1
+𝐹𝑖,𝑗.
+As illustrated in Figure 2(c), once these values are obtained, each
+worker normalizes their data by subtracting 𝜇𝑗from each entry
+in super-group 𝑗, making it zero-mean, and then uses 𝐹𝑗values to
+determine the bitwidth and reorder the data as we explain next.
+3.2
+Determining super-group bitwidths
+Due to the skewed distribution of the gradients (Figure 1), allocating
+more bits to super-groups with larger norms could substantially
+decrease the quantization error. We use variable bitwidth allocation
+to minimize the quantization error and respect any given band-
+width constraint. In particular, DynamiQ accepts a parameter ¯𝑏
+that denotes the average per-coordinate bit-budget. That is, for
+any throughput optimal primitive (e.g., Ring, Butterfly), the total
+number of bits to be sent by the network is 2(𝑛−1)
+𝑛
+¯𝑏per coordinate
+per worker, where 𝑛is the number of workers. This includes both
+the quantized data and any additional metadata (e.g., scales). (Note
+¯𝑏must be large enough for the metadata and 1 bit per entry.)
+To allow efficient bit packing, we limit the possible quantized
+bitwidths to powers of 2, namely, 1,2,4,8, and 16. This also has the
+
+===== PAGE 4 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝑢𝑝𝑒𝑟-𝑔𝑟𝑜𝑢𝑝 𝑀𝑒𝑡𝑎𝑑𝑎𝑡𝑎
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝐷𝑎𝑡𝑎
+(a) Each worker computes its super-group metadata.
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝐴𝑔𝑔𝑟𝑒𝑔𝑎𝑡𝑒𝑑 
+𝑆𝑢𝑝𝑒𝑟-𝑔𝑟𝑜𝑢𝑝 𝑀𝑒𝑡𝑎𝑑𝑎𝑡𝑎
+(b) Lightweight all-reduce syncs super-group metadata.
+𝑆𝐺1
+𝑆𝐺3
+𝑆𝐺2
+𝑆𝐺1
+𝑆𝐺3
+𝑆𝐺2
+𝑆𝐺1
+𝑆𝐺3
+𝑆𝐺2
+𝑁𝑜𝑟𝑚𝑎𝑙𝑖𝑧𝑒𝑑 𝑎𝑛𝑑 
+𝑟𝑒𝑜𝑟𝑑𝑒𝑟𝑒𝑑 𝑑𝑎𝑡𝑎
+(c) Data normalization and reordering based on synced metadata.
+𝑄𝑢𝑎𝑛𝑡𝑖𝑧𝑒𝑑 𝑑𝑎𝑡𝑎
+𝐷𝑒𝑐𝑜𝑚𝑝𝑟𝑒𝑠𝑠
++
+𝐴𝑐𝑐𝑢𝑚𝑢𝑙𝑎𝑡𝑒
+𝑅𝑒𝑐𝑜𝑚𝑝𝑟𝑒𝑠𝑠
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝐼𝑛𝑝𝑢𝑡 𝑓𝑟𝑜𝑚
+𝑝𝑟𝑒𝑣 𝑤𝑜𝑟𝑘𝑒𝑟
+𝑂𝑢𝑡𝑝𝑢𝑡 𝑡𝑜
+𝑛𝑒𝑥𝑡 𝑤𝑜𝑟𝑘𝑒𝑟
+𝐹𝑢𝑠𝑒𝑑 
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+(d) A worker receives quantized data and applies the fused kernel.
+𝑆𝐺1
+𝑆𝐺3
+𝑆𝐺2
+𝑆𝐺1
+𝑆𝐺3
+𝑆𝐺2
+𝑆𝐺1
+𝑆𝐺3
+𝑆𝐺2
+𝑅𝑒𝑜𝑟𝑑𝑒𝑟𝑒𝑑 𝑎𝑛𝑑 
+𝑛𝑜𝑟𝑚𝑎𝑙𝑖𝑧𝑒𝑑
+ 𝑎𝑔𝑔𝑟𝑒𝑔𝑎𝑡𝑒𝑑 data
+(e) At the end of the main all-reduce, entries are synced.
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝐺1
+𝑆𝐺2
+𝑆𝐺3
+𝑆𝑦𝑛𝑐ℎ𝑟𝑜𝑛𝑖𝑧𝑒𝑑 𝑔𝑟𝑎𝑑𝑖𝑒𝑛𝑡
+(f) Unnormalize and order entries to obtain the synced gradient.
+Figure 2: The DynamiQ workflow: (a) workers first compute the metadata (mean and ℓ2 norm) for each of their super-groups; (b) a lightweight
+all-reduce call aggregated the metadata such that all workers know that global super-group means and sum of ℓ2 norms; (c) based on the
+aggregated metadata, each worker normalizes each super-group by subtracting its global mean and reorders the super-groups based on their
+bit width which is based on the ℓ2 norms. Notice that in this example, SG3 has lower bit width than SG2 and thus their places are swapped; (d)
+illustrates how the blue worker operates during the main all reduce. It invokes the fused kernel to first decompress the received compressed
+partial sums data from the green worker, accumulates its local data, and recompresses the result before sending it to the red worker; (e) after
+the main all-reduce terminates, all workers have the same aggregated sums; (f) each worker adds back the global mean of each super-group
+and orders the data back to obtain the synced gradient.
+benefit of simplifying finding a performant variable quantization.
+As the choice of 16 bits corresponds to uncompressed values, this
+generalizes existing approaches where some entries (such as top-
+𝑘/outliers) are encoded accurately while others are quantized to
+a smaller number of bits [23].
+We now describe our fast heuristic approach to bandwidth par-
+titioning to the different super-groups. For a given set of allowed
+bitwidths (e.g., 𝑊= {1, 2, 4, 8, 16}), we use thresholds 𝑇𝑎,𝑏(dashed
+lines in Figure 3), where 𝑎,𝑏are consecutive in 𝑊, to denote the
+boundary of the 𝐹𝑗values with the same allocation. Intuitively, the
+MSE of quantizing a set is proportional to its squared norm, and
+thus the 𝐹𝑗values serve as proxy for the expected error of the 𝑗’th
+super-group. For ease of presentation, in this section we use the
+above 𝑊, although the technique is general.
+Let 𝑇0,1 = 0 and 𝑇16,32 = ∞for convenience. Then, all entries
+within super-groups with 𝐹𝑗∈[𝑇𝑎,𝑏,𝑇𝑏,𝑐) are quantized to 𝑏bits.
+Next, we derive the relations between the thresholds. Suppose we
+start from a given set of thresholds
+
+𝑇𝑎,𝑏
+	
+and want to increase
+the bandwidth in a way that best reduces the MSE. This can be
+achieved by lowering a selected threshold
+
+𝑇𝑎,𝑏
+	
+, increasing the
+quantized bit width of some super-group from 𝑎to 𝑏bits per entry.
+The intuition behind our approach is based on a simple worst-
+case analysis. Consider an example where 𝑄includes two quanti-
+zation values 0, 1 and an entry 𝑥∈[0, 1]. The worst-case variance
+for b𝑥is when 𝑥= 1/2, which yields Var[b𝑥] = 1/4. Now, suppose
+we increase the quantization bit width by 1 bit per entry (i.e., we
+double the size of 𝑄). In that case, we can place a quantization value
+between every two consecutive values in 𝑄, including between
+0 and 1. If this extra quantization value is at 1/2, the worst-case
+becomes when 𝑥= 1/4, yielding Var[b𝑥] = 1/16, i.e., a 4× reduction.
+This reduction generalizes to any two consecutive quantization
+values 𝑥↓,𝑥↑∈𝑄, i.e., for each additional bit, we can reduce the
+worst-case MSE of the entire vector by 4×.
+Suppose we decrease 𝑇𝑎,𝑏just enough that a single super-group
+𝑗will have its entries encoded by 𝑏bits instead of 𝑎. The above
+intuition suggests that each added bit decreases the MSE roughly 4×.
+
+===== PAGE 5 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Sum ℓ2 squared norm per super-group
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+10−2010−1710−1410−1110−8 10−5 10−2 101
+(a) LLaMA 1B MMLU
+Sum ℓ2 squared norm per super-group
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+10−2010−1710−1410−1110−8 10−5 10−2 101
+(b) Gemma 1B Chat
+Figure 3: The CDF distribution of 𝐹𝑗, summed ℓ2 squared norm per
+super-group across workers. The vertical dashed lines are thresholds
+for our variable bitwidth allocation algorithms, where super-groups
+with larger ℓ2 norms are assigned more bits in one of 2, 4, or 8 bits.
+If the super-group previously had an MSE proportional to 𝑇𝑎,𝑏· 4−𝑎,
+then its MSE lowers by roughly proportionally to 𝑇𝑎,𝑏· (4−𝑎−4−𝑏)
+while increasing the bandwidth by 𝑏−𝑎bits per entry in this super-
+group. We therefore estimate the per-bit benefit of this action by
+𝑇𝑎,𝑏·(4𝑏−𝑎−1)
+4𝑏·(𝑏−𝑎)
+. For example, if 𝑎= 1,𝑏= 2, we lower the MSE by
+about 𝑇1,2 · 3/16 with a per-bit benefit of 𝑇1,2 · 3/16. Similarly, if
+𝑎= 2,𝑏= 4, we lower the MSE about 𝑇2,4 · 15/256 and the per-bit
+benefit is 𝑇2,4 · 15/512 while the per-bit benefit of lowering 𝑇4,8 is
+255/49. To optimize the thresholds selection, we require that the
+per-bit benefit of increasing all thresholds is roughly the same (e.g.,
+𝑇1,2 · 3/16 = 𝑇2,4 · 15/256), yielding:
+𝑇1,2 = 5/32 · 𝑇2,4,
+𝑇2,4 = 17/512 · 𝑇4,8,
+𝑇4,8 = 257/217 · 𝑇8,16.
+Notice that this gives us |𝑊| −1 constraints, leaving a single
+degree of freedom (e.g., by selecting 𝑇1,2, the rest are determined).
+Accordingly, we search for the value of𝑇1,2 and determine the other
+thresholds by the above formula, such that the desired bandwidth
+constraint ¯𝑏is met.
+Since we are interested in minimizing the computational over-
+head of finding the above threshold, for the practical case where at
+most three permissible bitwidths are used (e.g., we use𝑊= {2, 4, 8}
+in our implementation), we develop a fast binary-search-based so-
+lution to determine the thresholds in Section A.
+3.3
+DynamiQ’s quantization
+We now describe DynamiQ’s quantization algorithm. The algorithm
+is used to compress the data of the first chunk along the aggregation
+topology, as well as for decompressing and recompressing partial
+sums, as illustrated in Figure 2(d).
+Non-uniform quantization. Motivated by Section 2.2, DynamiQ
+uses grouped quantization where a given group 𝐺is quantized
+using 𝑏bits. Each group is also associated with metadata, namely,
+a scaling parameter sf , which is used as explained below. With 𝑏
+bits per entry, we can represent each entry using a sign bit and a
+representation in
+
+0, . . . , 2𝑏−1 −1
+	
+. We hereafter assume that all
+quantization values 𝑞∈𝑄are non-negative as we encode the sign
+bit separately. We choose the values of 𝑄non-uniformly, similarly
+to [34]. Specifically, denoting 𝑓(𝜖,𝑟) =
+(1+2𝜖2)𝑟−1
+(1+2𝜖2)2𝑏−1−1−1, for a param-
+eter 𝜖> 0, we use
+𝑄=
+
+𝑓(𝜖,𝑟) | 𝑟∈
+
+0, . . . , 2𝑏−1 −1
+		
+.
+The result is some 𝑄⊂[0, 1], where 𝜖affects how non-uniform
+the quantization values are. Intuitively, when 𝜖≈0, 𝑄is roughly
+uniformly partitioned in [0, 1]; a larger 𝜖yields more quantization
+values close to zero and fewer large ones.
+Note that as the entries in 𝐺can be arbitrary BF16 values, we
+need to normalize them to [0, 1] before we can stochastically quan-
+tize to 𝑄; this is achieved by dividing each entry 𝑥by max |𝐺| ≜
+max {|𝑥| | 𝑥∈𝐺} and encoding the sign of 𝑥separately.
+Hierarchical quantization. Next, the sender represents the group
+using a scaling factor sf and a per-entry tuple (𝑟,𝜍), where 𝑟is the
+representation and 𝜍is the sign bit. In turn, the receiver estimates
+the entry as 𝜍· 𝑓(𝜖,𝑟) · sf .
+The natural choice is to set the scaling factor of the group 𝐺to
+sfG = max {|𝑥| | 𝑥∈𝐺}. However, this would require transmitting
+sfG in high precision (e.g., 16 bits), incurring a significant bandwidth
+overhead when the group size 𝑠is small.
+Instead, DynamiQ optimizes the accuracy-bandwidth tradeoff
+by quantizing the scaling factors within a super-group, a method
+known as hierarchical quantization [9]. Namely, let G be a super-
+group, and let sfG = max |G| equal the largest absolute value of an
+entry in G, i.e., max {|𝑥| | 𝑥∈G}. We encode sfG in half-precision
+for the entire super-group, and quantize each individual group’s
+scaling factor using uniform stochastic quantization such that
+E[sfG] = max |𝐺|. For example, we can represent sfG using a UINT8
+representation 𝑟𝐺∈{0, . . . , 255}, decoded as sfG = 𝑟𝐺· sfG/255.
+An essential property of our hierarchical quantization is that the
+estimates of individual entries remain unbiased. Consider a specific
+entry 𝑥∈𝐺. It is first normalized to 𝑥′ = 𝑥/max |𝐺|, which is then
+stochastically quantized to b𝑥′ ∈𝑄. As explained above, the scale of
+the group itself is then stochastically quantized to
+sfG ∈
+
+𝑟𝐺· sfG/255 | 𝑟𝐺∈{0, . . . , 255}
+	
+.
+The estimated value of 𝑥is therefore: b𝑥= b𝑥′ · sfG, which, due to
+the independence of the randomness used in the two quantization
+steps (of 𝑥′ and of sfG), satisfies:
+E[b𝑥] =E[b𝑥′ · sfG] =E[b𝑥′] · E[sfG] =(𝑥/max |𝐺|) · max |𝐺| = 𝑥.
+That is, even though quantizing sfG simultaneously scales all en-
+tries in 𝐺within the same scaling factor, the individual entries’
+unbiasedness is retained.
+Correlated rounding. We now explain how to leverage negative
+correlation (Section 2.4) in the stochastic quantization of the entries.
+Intuitively, we want to increase the likelihood that if a given worker
+quantizes a specific partial sum upwards, another will quantize
+down, so that the overall result is closer to the true sum.
+Formally, let 𝑝𝑖be the probability of rounding up a given re-
+compressed partial sum at worker 𝑖. As exemplified in Section 2.4,
+stochastic rounding is commonly implemented by drawing a uni-
+form random variable 𝑢𝑖∼U[0, 1] and rounding up if 𝑢𝑖< 𝑝𝑖
+and rounding down otherwise. Using Suresh et al. [75] correlated
+sampling method, instead of drawing 𝑢𝑖independently at random
+for different workers, we set
+𝑢𝑖= 𝜋𝑖+ 𝛾𝑖
+𝑛
+.
+Here, 𝜋= {𝜋𝑖} is a random permutation of 0, . . . ,𝑛−1 and 𝛾𝑖∼
+U[0, 1]. Importantly, 𝜋is implicitly agreed upon by all workers
+as it is independently generated using the same pseudo-random
+number generator and is not communicated.
+
+===== PAGE 6 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+Each 𝑢𝑖is still uniformly distributed, but now correlated across
+workers. That is, in every interval [0, 1
+𝑛), · · · , [ 𝑛−1
+𝑛, 1) exactly one
+worker’s𝑢𝑖falls inside. Intuitively, if𝑢𝑖from one worker falls within
+[0, 1
+𝑛) so that worker 𝑖rounds up with high probability, there will
+be another worker 𝑖′ such that 𝑈𝑖′ ∈[ 𝑛−1
+𝑛, 1) and worker 𝑖′ rounds
+down with high probability, canceling the error.
+3.4
+Main all-reduce
+DynamiQ’s main all-reduce phase follows standard communication
+patterns such as ring [1] and butterfly [78], but with compressed
+transfers. We next explain DynamiQ’s two all-reduce components.
+Reduce-scatter. The 𝑛workers split their gradients into 𝑛chunks,
+where 𝐶𝑖,𝑗is the 𝑖’th chunk of the 𝑗’th worker. For each index
+𝑖∈{0, . . . ,𝑛−1}, chunks
+
+𝐶𝑖,𝑗| 𝑗∈{0, . . . ,𝑛−1}
+	
+are aggregated,
+in parallel with chunk sets of other 𝑖’s. For each such 𝑖, the reduce-
+scatter topology is an in-arborescence, i.e., a tree where all edges
+point towards a single sink. For example, on a ring all-reduce, the
+aggregation topology for a single chunk is simply a path, while for
+butterfly we visualize the topology in Figure 13 in Section B.1
+The aggregation works as follows: Leaf nodes (which receive
+no external messages for a specific chunk index 𝑖) transmit their
+compressed local chunk to the next node in the topology. Internal
+nodes serve as intermediaries that decompress and aggregate partial
+sums (including their local chunk), recompress, and send to the
+next node, while the sink node for the chunk terminates its reduce-
+scatter phase by decompressing and adding its local chunk.
+All-gather. Upon the completion of the reduce-scatter phase, the
+all-gather phase commences, during which the sinks broadcast the
+aggregated sums to all other workers.
+Fused kernels. We now describe how we optimize the all-reduce
+(illustrated in Figure 2(d)). DynamiQ employs four distinct types of
+fused kernels determined by the accumulation state and node type.
+The first kernel is used to compress the chunk entries at the leaf
+nodes. Internal nodes then use a decompress-accumulate kernel
+when they have received partial sums from all but the last of their
+parent nodes. When receiving the partial sum of the last parent,
+they apply a decompress-accumulate-recompress kernel to also get
+the sum ready for the next transmission.
+The aggregated compressed chunk sums then continue to the all-
+gather phase, where they are broadcast. Whenever a node receives
+a compressed sum, it invokes the decompress kernel (ending in Fig-
+ure 2(e)). The operation concludes with a final reconstruction step
+(Figure 2(f)) where entries are restored to their original order and
+unnormalized by adding back the mean value, which was subtracted
+during the initial all-reduce step, to recover the final output.
+3.5
+Communication and runtime overhead
+We summarize DynamiQ’s communication and runtime overheads.
+Communication overhead. DynamiQ incurs communication in
+two all-reduce stages. First, in the lightweight all-reduce stage, let
+𝐶and 𝐶s be the group and super-group sizes. For each super-group
+G, DynamiQ computes exactly two BF16 numbers via the reduc-
+tion, 𝜇G and 𝐹G. Therefore, this stage communicates 32/𝐶s bits per
+1Note that as the different 𝑖’s are aggregated in parallel; e.g., in ring all-reduce, each
+node acts both as a sender and a receiver, and the total communication pattern forms
+a cycle.
+coordinate. Second, in the main all-reduce stage, as explained in Sec-
+tion 3.2, DynamiQ deducts the bandwidth used by the lightweight
+stage from the overall communication budget. Thus, the main stage
+uses ¯𝑏−32/𝐶s bits per coordinate. For example, for ¯𝑏= 5 and
+𝐶s = 256, the first stage uses 32/𝐶s = 0.125, leaving ¯𝑏−0.125 = 4.875
+bits per coordinate for the second (main) stage for both the quan-
+tized representations and group and super-group scales. For groups
+of size 𝐶= 16, the group’s scale takes 8/𝐶= 0.5 bits per coordinate
+and the super-groups’ scale takes additional 16/𝐶s = 1/16 bits per
+coordinate. This leaves 4.875 −0.5 −1/16 = 4.3125 bits on average
+for each quantized coordinate’s representation. This bit budget is
+divided among super-groups with, e.g., 2, 4, or 8 bitwidths (as de-
+tailed in Section 3.2) such that the resulting average is 4.3125. The
+reordering stage incurs no communication, since it only permutes
+super-groups locally into a pre-allocated tensor in monotonically
+increasing bitwidth order.
+Compute overhead. All DynamiQ operations are linear in the
+gradient size and rely on sequential memory accesses to HBM. The
+lightweight stage computes 𝜇G and 𝐹G for all super-groups using
+a single kernel launch with one memory access per entry. The re-
+ordering stage performs a single read and write per entry, with only
+a small additional overhead for maintaining the super-group indices.
+The main decompress–accumulate and decompress–accumulate–
+recompress operations are each implemented as a single fused ker-
+nel. Each value is reconstructed on the fly from its quantization bin
+and scale, accumulated, and requantized without materializing in-
+termediate tensors. Correlated rounding adds only local arithmetic
+and does not require additional memory accesses.
+4
+Implementation
+We implement the DynamiQ prototype atop PyTorch DDP [57] with
+NCCL [11] P2P. Our code is available at Github [41]. As mentioned,
+our prototype centers on four CUDA kernels:
+(1) DynamiQ_compress(𝑡) compresses a gradient chunk 𝑡at a leaf
+node in the aggregation topology.
+(2) DynamiQ_decompress(ct) decompresses a compressed gradi-
+ent chunk 𝑐𝑡at the all-gather stage of all-reduce.
+(3) DynamiQ_decompress_accumulate_recompress(𝑐𝑡, 𝑡) in non-
+leaf nodes fuses decompressing 𝑐𝑡, accumulating it with 𝑡, and
+recompressing the sum.
+(4) DynamiQ_decompress_accumulate(𝑐𝑡, 𝑡) in intermediate hops
+executes decompression of 𝑐𝑡and accumulating the result with
+𝑡(without recompression).
+Efficient fused-kernel CUDA implementation. GPUs are typi-
+cally memory-bound for elementwise operations [3, 5, 40], which
+means that the compression overhead is mainly determined by
+global memory transactions. Our design, therefore, minimizes this
+overhead by using fused kernels.
+DynamiQ_decompress_accumulate_recompress, for example,
+fuses these three operations. The intermediate results are stored in
+registers, avoiding global memory accesses. As Table 2 shows, this
+significantly reduces memory traffic, making DynamiQ’s involved
+logic computationally lightweight.
+The super-group reordering allows GPU kernels to receive a
+sequence of streams of uniform bitwidth entries, enabling efficient
+
+===== PAGE 7 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+memory addressing and coalescing. To share the maximum per-
+group gradient value for scaling, we use the classic parallel maxi-
+mum reduction algorithm in CUDA. We use powers of two for the
+group size and super-group size to allow more effective threaded
+memory access and execution.
+The DDP communication hook and RDMA engine. We build
+the communication hook from P2P primitives, using NCCL within
+a node and RDMA across nodes. This enables all-reduce topologies
+not natively supported by NCCL collectives, including butterfly.
+Also, our RDMA engine overlaps compression with communication
+using blockwise pipelining. As soon as a gradient block completes
+decompress_accumulate_recompress, its RDMA transfer begins
+while subsequent blocks are processed (we use a block size of 8 MB
+in our experiemtns).
+5
+Evaluation
+In this section, we present an end-to-end testbed evaluation of
+DynamiQ across four LLM full-parameter supervised fine-tuning
+workloads (that produce dense gradients) and compare it with state-
+of-the-art gradient compression schemes. We first use the ring
+all-reduce topology and evaluate performance both in isolation
+(Section 5.1) and over a shared network (Section 5.2). Then, to
+demonstrate the applicability of DynamiQ to different topologies,
+we then consider butterfly all-reduce (Section 5.3).
+Testbed. Our testbed consists of four servers running CentOS. Each
+server is equipped with two NVIDIA RTX A6000 GPUs, each with
+48 GB of GDDR6 memory and 768 GB/s of memory bandwidth. The
+two GPUs are connected through NVLink (NV4). Each server also
+has two 100 Gb/s NVIDIA Mellanox ConnectX-6 NICs, of which we
+use one in our experiments. Each server contains two 16-core AMD
+EPYC 7313 CPUs and 512 GB of host memory. Each GPU is con-
+nected to the host through PCIe 4.0 x16, providing approximately
+32 GB/s of bandwidth per direction.
+Workloads. We evaluate DynamiQ on four diverse training (fine-
+tuning) tasks representative of distinct model families and paradigms:
+standard masked language modeling with BERT-large [31] on Wikitext-
+103 [61]; decoder-based instruction tuning with Gemma 1B [77] on
+UltraChat [32]; reasoning with LLaMA 1B [35] on both UltraChat
+and MMLU [44].
+Parameter setup. Table 1 summarizes the batch size (in terms of to-
+kens and sequences) and learning rate configurations we use in our
+experiments. For Wikitext and UltraChat, following common prac-
+tice, we truncate and pack tokens into fixed-length sequences (po-
+tentially merging consecutive samples). For learning rate schedul-
+ing, we use the standard torch.optim.lr_scheduler.LinearLR
+scheduler with parameters detailed in the table.
+Baseline compression schemes. We compare DynamiQ against
+standard uncompressed BFloat16 [2] (BF16) format and 5 state-of-
+the-art gradient compression schemes covering both traditional
+and emerging standards: adaptive sparsification via OmniReduce
+(OR) [36], optimized fixed-point quantization via THC [56] and
+emerging microscaling formats (MXFP8, MXFP6 and MXFP4) [70].
+THC and OmniReduce were originally designed for the parameter-
+server architecture [55] and are thus not optimized for multi-hop
+all-reduce. To ensure a fair comparison, we adapt them as follows.
+For THC, directly summing quantized gradients via multi-hop all-
+reduce leads to catastrophic overflows given limited bits 𝑏. Conse-
+quently, following the original paper, we compress local gradients
+into 𝑞= 4-bit integers and allocate 𝑏= 8 bits per coordinate for
+aggregation. For OmniReduce, we allocate 𝑏= 8 bits and employ
+its chunked Top-𝑘compression variant. Since local Top-𝑘chunk
+indices differ across workers, we first aggregate indices appearing
+in at least one worker and then transmit the union. The challenge
+lies in dynamically determining 𝑘such that the union of local Top-𝑘
+chunks equals 𝐾; we address this with a heuristic algorithm de-
+scribed in Appendix C.
+For the microscaling formats, we use E4M3, E3M2, and E2M1
+for MXFP8, MXFP6, and MXFP4, respectively. For all formats, the
+chunk size is 32 and the per-chunk shared scale is BF16. For sum-
+mation arithmetic and overflow and underflow hadling, we follow
+the implementation of FP8-LM [68]. We also dynamically adjust
+the per-chunk scales prior to the main all-reduce stage across train-
+ing rounds to minimize overflows and underflows as described in
+Section C. Finally, since MXFP4 and MXFP6 are not natively sup-
+ported by our testbed GPUs, we report their best-case (i.e., lower-
+bound) TTA estimates. This is done by decoupling accuracy (which
+is software-based) and timing (we transmit the equivalent traffic
+without performing any compute) measurments.
+DynamiQ’s configuration. Unless otherwise stated, we set the
+group size as 𝑠= 16 coordinates and the super-group size as 𝑆= 256
+coordinates (i.e., 16 consecutive groups). As explained in Section 3.3,
+per-group scaling parameters are quantized into UINT8 and per-
+super-group scaling parameters are kept as BF16.
+We use 𝑊= {2, 4, 8} and the approximation algorithm of Sec-
+tion A to determine the bit allocation. Unless otherwise noted, we
+fix the overall budget at 𝑏= 5 bits per coordinate, which we demon-
+strate to achieve the best end-to-end performance in our ablation
+study (see Figure 7).
+Metrics. We evaluate the end-to-end performance using the well-
+established time-to-accuracy (TTA) metric and pay special attention
+to the final accuracy. Namely, while TTA tracks evaluation accu-
+racy 2 as a function of wall-clock time, final accuracy is recorded
+once the model converges. We also benchmark throughput (in
+rounds per second) and quantization error to assess the speed and
+quality of our quantization compared to other schemes. For the lat-
+ter, we employ the vector normalized mean squared error (vNMSE)
+metric [23, 33, 49, 56, 80, 81], defined as E
+h𝑋−ˆ𝑋
+2i
+/∥𝑋∥2.
+Workload
+BERT-large
+LLaMA 1B
+Gemma 1B Chat
+LLaMA 1B
+MaskedLM
+Chat
+Chat
+MMLU
+Tokens per batch
+2048
+3000
+3000
+∼1600
+Batch size
+1
+1
+1
+4
+Initial LR
+5 × 10−5
+2 × 10−5
+1.4 × 10−5
+6 × 10−6
+Linear LR end factors
+1/16
+1/8
+1/8
+1/8
+Linear LR total iters (Epochs)
+15
+2
+2
+2
+Total iters (Epochs)
+21
+3
+3
+3
+Table 1: Configurations of the average number of tokens and the
+learning rate schedules in our workloads.
+2Here we use the general term "accuracy" to refer to the respective LLM evaluation met-
+ric, including perplexity for MaskedLM and CausalLM for UltraChat, and classification
+accuracy for multiple choice question answering.
+
+===== PAGE 8 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+105
+100.5
+100.1
+Target Perplexity Relative to
+the Final Accuracy of BF16 (%)
+40
+60
+80
+100
+120
+140
+Time Relative to BF16 (%)  
+(a) BERT-large MaskedLM
+105
+100.5
+100.1
+Target Perplexity Relative to
+the Final Accuracy of BF16 (%)
+40
+60
+80
+100
+120
+140
+Time Relative to BF16 (%)  
+(b) Gemma 1B Chat
+105
+100.5
+100.1
+Target Perplexity Relative to
+the Final Accuracy of BF16 (%)
+40
+60
+80
+100
+120
+140
+Time Relative to BF16 (%)  
+(c) LLaMA 1B Chat
+90
+99
+99.9
+Target Accuracy Relative to
+ the Final Accuracy of BF16 (%)
+40
+60
+80
+100
+120
+140
+Time Relative to BF16 (%)  
+(d) LLaMA 1B MMLU
+Figure 4: Time-to-target perplexity and accuracy for training (fine-tuning) LLMs on 8-GPU/4-worker testbed using ring all-reduce. We measure
+the time required relative to BF16 (lower is better) to reach specific convergence targets defined by BF16’s final metrics (perplexities of
+3.107, 2.996, 3.095 and accuracy of 73.04%). For example, for BERT-large, "105%" means we measure the time it takes to reach the perplexity of
+3.107 · 1.05 ≈3.22, and for LLaMA 1B MMLU, "99%" means we measure the time it takes to reach the accuracy of 73.04 · 0.99 ≈72.3%. Bars are
+omitted for methods that do not reach the specified target.
+5.1
+Ring all-reduce
+We next evaluate DynamiQ’s end-to-end performance with ring
+all-reduce, demonstrating that it offers substantial acceleration
+over BF16 and significantly better TTA curves than all other tested
+compression schemes. Importantly, DynamiQ outperforms MXFP8
+across all workloads despite using a lower bit budget, which is
+attributed to its ability to maintain both low compression error
+and to incur small computational overhead despite its “involved”
+two-phase workflow.
+Time to accuracy (TTA). As highlighted in Figure 4 and further
+detailed in Figure 5, DynamiQ consistently produces better TTA
+curves across all workloads. For instance, on Gemma 1B, DynamiQ
+achieves target perplexity 18%−28% faster than MXFP8 and MXFP6
+respectively, while THC, Omnireduce, and MXFP4 either converge
+slower than the BF16 baseline or do not reach target accuracy due
+to excessive compression error. Similarly, for LLaMA fine-tuning,
+DynamiQ reaches 72.38% (99% of BF16’s accuracy) accuracy ap-
+proximately 34.5% faster than MXFP8 and 40.8% faster than BF16.
+Crucially, DynamiQ maintains final accuracy within 0.1% of un-
+compressed BF16 across all scenarios, whereas other compression
+schemes exhibit degradation of up to 2.5%.
+To shed more light on the performance of the different schemes,
+we next display their throughput and compression error measure-
+ments separately. Then, we show TTA curves for DynamiQ un-
+der different bit-budgets, clarifying our choice of five bits per-
+parameter.
+Throughput. The TTA gains of DynamiQ are partially attributable
+to its improved training throughput, as shown in Figure 6. It is evi-
+dent that the compression overhead of DynamiQ remains small, as
+gradient compression on GPUs is typically memory-bound rather
+than compute-bound [6]. Accordingly, by leveraging fused kernels,
+DynamiQ ensures a coalesced memory access pattern where each
+gradient coordinate is accessed only once, maintaining parity with
+the memory transaction volume of MXFP8 (see Table 2). In contrast,
+the randomized Hadamard transform used in THC [56] requires
+𝑂(log𝑑) additional global GPU memory accesses, creating a bot-
+tleneck that consumes up to 42% of the training round time in the
+LLaMA 1B workload.
+Compression scheme
+Global Memory Transactions
+BF16
+4 + 4 · 𝐴𝑅
+DynamiQ
+22 + 11.875 · 𝐴𝑅
+MXFP8
+18 + 13 · 𝐴𝑅
+THC
+74 + 2 · 𝐴𝑅
+Table 2: Estimated extra DRAM memory transactions (bytes per
+coordinate) for different all-reduce compression schemes, excluding
+NIC-GPU data transfer. 𝐴𝑅= 𝑛−1
+𝑛
+∈[ 1
+2, 1) denotes the per-worker
+data fraction transferred during reduce-scatter and all-gather phases.
+Workload
+BERT-large
+LLaMA 1B
+Gemma 1B
+LLaMA 1B
+MaskedLM
+Chat
+Chat
+MMLU
+DynamiQ
+0.00217
+0.00149
+0.00122
+0.00096
+MXFP8
+0.00591
+0.00320
+0.00308
+0.00299
+MXFP6
+0.02332
+0.01350
+0.01458
+0.01298
+MXFP4
+0.12080
+0.11059
+0.11583
+0.09039
+OR
+0.15499
+0.08044
+0.04676
+0.04530
+THC
+0.00897
+0.11978
+0.15168
+0.19599
+Table 3: Comparing compression error (vNMSE) for LLM training
+(fine-tuning) on an 8-GPU/4-worker testbed using ring all-reduce.
+In this table, we compute the average vNMSE over the entire end-to-
+end training process. The full version of round-to-vNMSE curves is
+shown in Figure 18.
+Compression error. As detailed in Table 3, DynamiQ demon-
+strates better fidelity to uncompressed gradients, achieving 2.5–3×
+lower vNMSE than MXFP8 and orders-of-magnitude lower vN-
+MSE than MXFP4, THC, and OmniReduce. These results further
+clarify the performance trade-offs observed earlier: while MXFP4
+offers higher throughput (Figure 6), its excessive error slows-down
+convergence and degrades final accuracy. Similarly, OmniReduce
+underperforms in these benchmarks because it relies on gradient
+sparsity and skewness (i.e., a large fraction of near-zero entries), an
+attribute largely absent in dense LLM gradients [92].
+DynamiQ’s bit-budget ablation. To justify our choice of using𝑏=
+5 bit-per-coordinate for DynamiQ, we next evaluate the impact of
+𝑏on DynamiQ’s TTA and convergence accuracy. Figure 7 presents
+results for the LLaMA 1B MMLU workload, demonstrating that
+𝑏= 5 indeed achieves the best trade-off in this scenario. Reducing
+
+===== PAGE 9 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+0.30
+0.65
+1.00
+1.35
+Time (h)
+3.10
+3.15
+3.20
+3.25
+Perplexity
+(a) BERT-large MaskedLM
+1
+2
+3
+4
+Time (h)
+3.095
+3.105
+3.115
+Perplexity
+(b) Gemma 1B Chat
+0.5
+1.5
+2.5
+3.5
+Time (h)
+3.00
+3.01
+3.02
+3.03
+Perplexity
+(c) LLaMA 1B Chat
+0.5
+1.5
+2.5
+Time (h)
+68
+70
+72
+Accuracy (%)
+(d) LLaMA 1B MMLU
+Figure 5: Zoomed-in Time to Accuracy (TTA) curves for LLM training (fine-tuning) on an 8-GPU/4-worker testbed using ring all-reduce.
+Horizontal dashed lines indicate the final BF16 accuracy. As mentioned, MXFP4 and MXFP6 curves represent a best-case scenario based on
+upper-bound throughput estimation. DynamiQ is the only method to consistently converge faster than BF16 while roughly matching its
+perplexity and accuracy, followed by MXFP8. Although alternatives like THC and OR also show faster-than-baseline initial convergence (see
+Appendix Fig. 14), their performance ultimately stalls due to high compression error (see Appendix Fig. 18).
+Computation
+Compression
+Exposed Communication
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+Compression Methods
+0.00
+0.05
+0.10
+0.15
+0.20
+Time per round (s)
+(a) BERT-large MaskedLM
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+Compression Methods
+0.0
+0.2
+0.4
+0.6
+0.8
+Time per round (s)
+(b) Gemma 1B Chat
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+Compression Methods
+0.0
+0.2
+0.4
+0.6
+0.8
+Time per round (s)
+(c) LLaMA 1B Chat
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+Compression Methods
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+Time per round (s)
+(d) LLaMA 1B MMLU
+Figure 6: Breakdown of training time into computation, exposed communication, and compression overhead. Compression refers to the extra
+time-per-round latency introduced with all compression operations, including fused kernels and reordering costs, that cannot overlap with
+computation. Exposed communication refers to the portion of communication latency not overlapped with computation or compression thus
+directly contributes to training duration.
+DynamiQ 3b
+DynamiQ 4b
+DynamiQ 5b
+DynamiQ 6b
+0.5
+1.0
+1.5
+2.0
+Time (h)
+68
+69
+70
+71
+72
+73
+Accuracy (%)
+(a) The overall TTA curves
+1.1
+1.3
+1.5
+1.7
+1.9
+2.1
+Time (h)
+72.0
+72.5
+73.0
+Accuracy (%)
+(b) The zoomed-in TTA curves
+Figure 7: DynamiQ’s bit-budget ablation. Displaying TTA curves
+for varying overall bit budget for training (fine-tuning) LLaMA 1B
+on the MMLU workload on an 8-GPU/4-worker testbed using ring
+all-reduce. The horizontal dashed lines represent the convergence
+accuracy of BF16.
+the bit budget below this threshold increases compression error
+and degrades final accuracy, while increasing 𝑏yields no accuracy
+gains and, as detailed in Table 4, merely reduces throughput due to
+higher communication volumes.
+5.2
+Ring all-reduce over a shared network
+In many setups, the training job may not run in isolation and has to
+share the network with other jobs or tenants. For example, multi-
+tenancy in cloud providers is a common practice for maximizing
+GPU utilization [25, 46]. Accordingly, in this experiment, we launch
+three additional DDP processes that continuously perform ring all-
+reduce operations, competing with the training job for bandwidth.
+Method
+LLaMA 1B MMLU
+Gemma 1B Chat
+vNMSE
+Thp.
+vNMSE
+Thp.
+DynamiQ 3b
+0.01603
+3.051
+0.02334
+1.440
+DynamiQ 4b
+0.00589
+2.842
+0.00831
+1.397
+DynamiQ 5b
+0.00096
+2.604
+0.00122
+1.353
+DynamiQ 6b
+0.00059
+2.390
+0.00053
+1.306
+MXFP8
+0.00299
+2.123
+0.00308
+1.246
+Table 4: DynamiQ’s bit-budget ablation. Displaying Throughput (in
+rounds per second) and vNMSE for varying overall bit budget for
+training (fine-tuning) LLaMA 1B on the MMLU workload on an 8-
+GPU/4-worker testbed using ring all-reduce. Results for MXFP8 are
+displayed for comparison.
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+1
+3
+5
+7
+Time (h)
+3.095
+3.105
+3.115
+3.125
+Perplexity
+(a) Gemma 1B Chat
+0.5
+1.5
+2.5
+3.5
+Time (h)
+68
+70
+72
+Accuracy (%)
+(b) LLaMA 1B MMLU
+Figure 8: Zoomed-in TTA curves over a shared network. The full
+curves and additional results appear in Section D.
+
+===== PAGE 10 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+Method
+Acc (%)
+vNMSE
+BF16
+73.04
+0
+DynamiQ
+73.04
+0.00067
+MXFP8
+72.86
+0.00203
+MXFP6
+72.46
+0.02008
+MXFP4
+71.59
+0.17058
+Table 5: Evaluation with butterfly all-reduce on the LLaMA 1B MMLU
+workload. We list the final accuracy the model converges, to relative
+to the BF16 baseline, and average quantization error (vNMSE).
+BF16
+MXFP8
+MXFP6
+MXFP4
+DynamiQ
+0.5
+1.5
+2.5
+3.5
+Time (h)
+68
+70
+72
+Accuracy (%)
+(a) LLaMA 1B MMLU
+Figure 9: The zoomed-in TTA of DynamiQ with butterfly all-reduce
+compared with the baselines. The full version is shown in Figure 16
+in the Appendix.
+Figure 8 shows, as expected, that the compression methods’, and
+particularly DynamiQ’s, TTA advantage over the BF16 baseline
+increases under bandwidth contention. For example, on Gemma 1B
++ Chat, DynamiQ’s advantage over MXFP8 increases from 16% in
+isolation to 21.5% over a shared network. Likewise, in the LLaMA
+1B + MMLU workload, the advantage increases from 34.5% to 40.2%.
+Interestingly, the exposed communication time is shorter than 4×
+the time in isolation, as the different jobs converge to transmitting
+only on partially overlapping timeframes.
+Finally, in the interest of space, full TTA curves and additional
+results are deferred to in Section D.
+5.3
+Butterfly all-reduce
+We proceed with an experiment with butterfly all-reduce [78],
+which reduces the number of hops to logarithmic in the number
+of workers, thereby reducing latency. Interestingly, it also reduces
+quantization error, as fewer re-quantizations are needed and the
+summed partial sums on the aggregation path tend to have a closer
+order of magnitude [67].
+Figure 9 depicts that, on the LLaMA 1B MMLU benchmark, Dy-
+namiQ achieves better TTA and, in particular, higher final accuracy
+than the MXFP4, MXFP6 and MXFP8 baselines. Specifically, Dy-
+namiQ attains an accuracy of 72.38% – corresponding to 99% of
+BF16’s final accuracy—12.0% faster than MXFP8; this advantage
+further increases to 37.8% when targeting 99.5% of BF16’s final
+accuracy. In addition, the microscaling baselines exhibit measur-
+able degradation in final accuracy (Table 5), whereas DynamiQ
+achieves a final accuracy comparable to BF16. This is explained by
+DynamiQ’s lower vNMSE (quantization error), as Table 5 shows.
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR 8b
+THC 8b
+DynamiQ 5b
+2
+4
+8
+#Workers
+10 3
+10 2
+10 1
+vNMSE
+(a) LLaMA 1B MMLU vNMSE
+2
+4
+8
+#Workers
+0.0
+0.5
+1.0
+1.5
+Diff Accuracy
+(b) LLaMA 1B MMLU ΔAccuracy
+Figure 10: Scalability evaluation on the LLaMA + MMLU task with 2
+to 8 workers, measuring the vNMSE and the MMLU’s accuracy with
+respect to the BF16 baseline.
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR 8b
+THC 8b
+DynamiQ 5b
+8
+16
+32
+64
+#Workers
+10 3
+10 2
+10 1
+vNMSE
+(a) TinyBERT GLUE vNMSE
+8
+16
+32
+64
+#Workers
+0
+0.005
+0.01
+0.02
+0.04
+0.08
+Diff CE Loss
+(b) TinyBERT GLUE ΔCE loss
+Figure 11: Scalability evaluation on the TinyBERT + GLUE task with
+8 to 64 workers, measuring vNMSE and the cross entropy loss with
+respect to the BF16 baseline.
+Lastly, we argue that this trend is expected to continue as the
+number of workers increases and provide theoretical intuition to
+support this in Section B.
+6
+Simulation Studies
+We next test the scalability of DynamiQ and perform a parametric
+study to shed more light on its individual design components.
+6.1
+Scalability analysis
+Setup and Methodology. We evaluate scalability by varying the
+worker count 𝑛from 2 to 64 across two workloads: LLaMA 1B
+MMLU (2–8 workers) and the smaller TinyBERT [48] on GLUE [83]
+(8–64 workers). In all experiments, we utilize ring all-reduce and
+benchmark performance against the BF16 baseline, measuring quan-
+tization error (vNMSE) and final accuracy (LLaMA 1B) and cross-
+entropy (CE) loss (TinyBERT). For THC, we adopt the authors’
+recommendation to allocate 12 bits for 𝑛> 8 to prevent gradient
+overflow during aggregation.
+LLaMA 1B. As the worker count increases, both the vNMSE and
+the accuracy degradation naturally increase across all methods.
+However, as shown in Figure 10, DynamiQ shows better scaling
+properties compared to the baselines nearing the accuracy of BF16
+even with 8 workers.
+TinyBERT. Extending the analysis to larger clusters with Tiny-
+BERT, Figure 11 confirms that DynamiQ consistently achieves the
+lowest vNMSE among all compression schemes up to 64 workers.
+Consequently, it yields the final accuracy closest to the BF16 base-
+line (Figure 11(b)). We note that inherent training variance in small
+models leads to minor fluctuations. For example, DynamiQ slightly
+
+===== PAGE 11 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Method
+LLaMA 1B Chat
+LLaMA 1B MMLU
+Uniform quantization
+0.1278
+0.1207
+Non-uniform quantization
+0.0707
+0.0664
++ Variable bitwidth allocation
+0.0198
+0.0130
++ Hierarchical quantization
+0.0138
+0.0092
++ Correlated rounding
+0.0091
+0.0059
+Table 6: vNMSE comparisons among different variants of DynamiQ
+for the LLaMA 1B Chat and LLaMA 1B MMLU workloads. For hier-
+archical quantization, we use a group size of 16 instead of 32.
+Number of bits ¯𝑏
+5
+6
+8.5
+DynamiQ-ring
+4.76
+0.751
+0.0105
+MXFP8-ring
+–
+–
+6.11
+DynamiQ-butterfly
+0.0336
+3.23 × 10−3
+2.75 × 10−5
+MXFP8-butterfly
+–
+–
+0.0353
+Table 7: Compression error (vNMSE) in a simulation with synthetic
+data and a DP dimension of 𝑛= 8,192, and a total of 32768 super-
+groups of 256 coordinates per worker.
+outperforms BF16 at 𝑛= 8 or MXFP8, showing marginally lower
+CE loss at 𝑛= 16, 32. However, the overall trend confirms that Dy-
+namiQ’s more scalable and stable than other compression methods.
+Finally, we observe that, as illustrated in Figure 11(a), THC and
+OR display slower vNMSE growth as 𝑛scales. For THC, this results
+from increasing the allocation from 8 to 12 bits for 𝑛> 8 to prevent
+overflows (satisfying 𝑏≥⌈log(15𝑛+ 1)⌉). However, as a strategy,
+this remains effective only up to 𝑛= 64. For OmniReduce (𝑏= 8),
+the error profile at this scale is determined by its sparsification
+policy, which consistently discards the bottom 50% of gradients.
+6.2
+Large-scale simulation
+To evaluate DynamiQ at a large scale, we simulate compressed
+all-reduce with a DP dimension of 𝑛= 8,192. To model the spatial
+locality and scale skew observed in Section 2.2 and Fig. 1, we assign
+each super-group a magnitude parameter, which determines the
+variance of all coordinates in that super-group.
+Synthetic data. We model the magnitude MG of a super-group G
+as a mixture of two LogNormal distributions; this captures well the
+empirical distribution of Figure 1(c), as described in Section E. For
+each G (of size 256), we sample each of its coordinates, for each
+worker, i.i.d. from N (0,
+MG2
+256 ). Consequently, coordinates within a
+super-group share a common scale, preserving spatial locality, while
+scales across super-groups span several orders of magnitude.
+Setup. We evaluate communication budgets of ¯𝑏∈{5, 6, 8.5}
+bits per coordinate under both ring and butterfly all-reduce. We
+compare DynamiQ against MXFP8-e4m3 (we omit other baselines
+since they overflow in this setting, yielding a prohibitively large
+vNMSE). Because MXFP8-e4m3 has a fixed communication cost of
+¯𝑏= 8.5, we report it only at that budget. For DynamiQ, we allow
+bitwidths from 𝑊= {2, 4, 8, 16}.
+Results. As shown in Table 7, DynamiQ achieves substantially
+lower vNMSE than MXFP8. With ring all-reduce and ¯𝑏= 8.5, Dy-
+namiQ achieves a vNMSE of 0.0105, which is ≈582 times lower
+than MXFP8. On the other hand, DynamiQ’s vNMSE with 5 bits
+roughly matches with MXFP8 that consumes ¯𝑏= 8.5 bits. Similarly,
+with butterfly all-reduce and ¯𝑏= 8.5, DynamiQ achieves a vNMSE
+of 2.75×10−5, which is 1283 times lower than MXFP8. We note that
+at this large DP dimension, MXFP8-ring and DynamiQ-ring with
+¯𝑏∈{5, 6} incur unacceptably large vNMSE. Thus, for DynamiQ-
+ring with this DP dimension, we recommend using ¯𝑏= 8.5, where
+for DynamiQ-butterfly, ¯𝑏= 6 suffices.
+We partially attribute these gains to two features of DynamiQ.
+First, its bit-allocation scheme assigns up to 16 bits to rare, high-
+norm super-groups without imposing this cost on all coordinates.
+Second, its decompress–accumulate–recompress procedure updates
+the group scales as the partial sums evolve, allowing the quanti-
+zation range to track the data well throughout the all-reduce. In
+contrast, MXFP8-e4m3 reserves four of its eight per-value bits for
+the exponent to represent a wide dynamic range uniformly.
+6.3
+Parametric study
+We next isolate the impact of DynamiQ’s optimization components,
+namely, variable bitwidth allocation, non-uniform quantization,
+hierarchical quantization, and correlated rounding, on compression
+error. The group size is set to 32 and reduced to 16 when hierarchical
+quantization (with INT8 scaling parameters) is used.
+Table 6 demonstrates that the cumulative application of these
+techniques reduces vNMSE by a factor of 14× for LLaMA 1B Chat
+and 22× for MMLU. Variable bitwidth allocation serves as the pri-
+mary driver, improving quantization accuracy by 3.5–5.1×. Comple-
+mentary techniques provide significant additive gains: non-uniform
+quantization reduces vNMSE by ∼45% (see Appendix Figure 12), hi-
+erarchical quantization by ∼30%, and correlated rounding by ∼35%.
+As discussed in Section 5.1, this order-of-magnitude reduction in
+error is essential for maintaining model accuracy comparable to
+uncompressed baselines. Crucially, as was shown in Figure 6, these
+enhancements introduce only a small computational overhead.
+7
+Related Work
+Gradient Compression and the Shift to all-reduce. Gradient
+compression is a well-established strategy for accelerating dis-
+tributed data-parallel (DDP) training by mitigating communication
+bottlenecks [55, 71, 72, 90]. While many such methods have been
+proposed [16, 17, 24, 28, 36, 50, 54, 56, 60, 74, 82, 84, 86, 87], these
+were designed for the parameter server architecture [47, 55]. In-
+deed, the recent paradigm shift toward multi-hop all-reduce for
+scaling LLM training [1, 10, 35, 45, 72] reveals significant limita-
+tions in these approaches. For instance, sparsity-based methods like
+OmniReduce [36] struggle to merge local TopK chunks efficiently
+across decentralized topologies. Similarly, quantization schemes
+such as QSGD [16], THC [56], and Terngrad [90] are prone to gradi-
+ent overflow during the aggregation of partial sums, a fundamental
+issue in multi-hop topologies that worsens with system size [42].
+While microscaling-based methods (e.g., MXFP4) [7, 68] alleviate
+this, they do not eliminate overflow/underflow entirely. By contrast,
+DynamiQ is explicitly architected for multi-hop all-reduce, employ-
+ing hop-wise decompression/recompression to strictly prevent over-
+flow and utilizing variable bitwidth allocation to ensure robustness.
+Compression Error and Scalability. Although LLMs exhibit some
+tolerance for compression noise, excessive error significantly de-
+grades convergence stability and final accuracy [52, 53]. Existing
+
+===== PAGE 12 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+schemes often prioritize inference hardware compatibility or spar-
+sity over minimizing the error (vNMSE). For example, microscaling
+techniques [70] optimize for GPU throughput but lack advanced
+error-reduction mechanisms, while OmniReduce relies on gradient
+sparsity that is largely absent in dense LLM updates. Furthermore,
+maintaining bounded error as the worker count𝑛increases presents
+a significant challenge; errors accumulate hop-by-hop, typically ne-
+cessitating a bitwidth growth that is proportional to the logarithm
+of the aggregation path length (as in THC) to prevent overflow. We
+empirically observe that for DynamiQ this growth is slower, but
+leave further investigation for future work.
+Hardware-Aware Implementation. Gradient compression on
+GPUs is predominantly memory-bound rather than compute-bound;
+performance is dictated by HBM bandwidth rather than floating-
+point throughput [3, 5, 6, 40]. Consequently, efficient implementa-
+tions must minimize HBM transactions, ideally ensuring sequential,
+single-pass access via kernel fusion [12]. Methods that fail to respect
+this constraint incur substantial overhead. A notable example is
+THC, where the Hadamard transform [43] requires 𝑂(log𝑑) passes
+over memory, creating a bottleneck. DynamiQ avoids such over-
+head by leveraging fused kernels that keep intermediate results in
+registers or shared memory, maintaining a memory access pattern
+comparable to standard uncompressed updates.
+Mixed-precision training. An emerging technique to accelerate
+training is using lower precision arithmetics [13, 26, 27, 66, 79, 85,
+91, 93]. This is motivated by new hardware capabilities that deliver
+higher throughput for low-precision operations [14]. Current best
+practices keep certain fields (e.g., outlier values or accumulators) in
+higher precision while using low precision elsewhere [85]. Recently,
+researchers proposed running the entire training process in low
+precision [26, 79], often leading to a degradation of accuracy that
+can be acceptable in certain scenarios.
+Sharded models. When models are too large to fit on a GPU,
+practitioners shard them across multiple workers, each holding
+a portion [69, 94]. In such cases, one may not need an all-reduce
+operation but rather only the reduce-scatter phase, since gradi-
+ents and weights are split across GPUs. DynamiQ can seamlessly
+integrate with this approach by decompressing at the end of the
+reduce-scatter phase.
+8
+Discussion and Limitations
+Implications for large-scale pre-training. Our testbed evalua-
+tion focuses on fine-tuning due to limited hardware resources, but
+it already covers DP dimensions up to 64. In real pre-training clus-
+ters, this can correspond to much larger total GPU counts, since 3D
+parallelism keeps the DP dimension substantially smaller than the
+total number of GPUs; for example, even clusters with up to 100K
+GPUs may still operate with comparable DP dimensions [29, 58, 62].
+Thus, our testbed results are directly relevant to realistic large-scale
+pre-training deployments. For even larger deployments, such as
+future million-GPU clusters, scaling DynamiQ primarily requires
+either increasing the bit budget or using hierarchical aggregation.
+Our simulations show that DynamiQ remains accurate at DP di-
+mension 8192 with an 8.5-bit budget, suggesting that modestly
+larger budgets can support much larger DP groups. Alternatively,
+hierarchical butterfly- or hypercube-style aggregation, which is
+commonly needed at such scales to bound tail latency, can also
+reduce the effective aggregation depth.
+Preserving model quality and numerical stability. For large-
+scale pre-training tasks, practitioners are often conservative about
+low-precision compression schemes [37, 38], because compression
+error can manifest as hidden instability that harms final model
+quality or convergence. For example, occasionally quantizing ex-
+treme values into an unsafe low-precision representation can lead
+to NaNs, causing model divergence, or otherwise substantially de-
+grade accuracy. DynamiQ’s super-group bitwidth allocation scheme
+(Section 3.2) naturally supports preserving such outlier values in
+the training precision, e.g., BF16.
+Compatibility with FSDP and MoE [73] gradients. DynamiQ is
+compatible with FSDP-style synchronization as FSDP decomposes
+synchronization into reduce-scatter and all-gather phases, to which
+DynamiQ’s multi-hop communication primitive can be applied as
+described in Section 3.4. For MoE gradients, where experts can be
+active or inactive, DynamiQ’s bit allocation can assign 0 bits to inac-
+tive expert super-groups while allocating more bits to active ones.
+Implications for high-end training hardware. Our hardware
+evaluation uses A6000 GPUs with 768 GB/s GPU memory band-
+width and 100 Gb/s inter-node bandwidth. Modern clusters with,
+e.g., GB200-class GPUs provide faster scale-out networks, such as
+400 Gb/s or 800 Gb/s links [63, 64], but also 16× higher FP16/BF16
+FLOPS and 10.4× memory bandwidth [65]. Therefore, communi-
+cation remains a bottleneck, especially under large data-parallel
+dimensions or shared-cluster contention.
+9
+Conclusion
+In this paper, we presented DynamiQ, a practical gradient compres-
+sion framework optimized for multi-hop all-reduce that can adjust
+to different bandwidth constraints and presents an attractive trade-
+off between communication overhead and accuracy. In contrast
+with existing gradient compression systems, which are designed
+for the parameter-server architecture and incur accuracy degrada-
+tion when deployed to multi-hop all-reduce, DynamiQ preserves
+low compression error along the aggregation paths, resulting in
+accelerated training without compromising model accuracy.
+We implement DynamiQ and evaluate its performance across
+diverse LLM training workloads using both ring and butterfly all-
+reduce. Our results show that DynamiQ consistently achieves signif-
+icantly better time-to-accuracy compared to alternatives. Notably,
+DynamiQ reaches 99.9% of BF16 baseline accuracy with only 5
+bits per coordinate, outperforming the state-of-the-art MXFP8. It
+is the only evaluated method to consistently maintain this fidelity
+while providing significant acceleration, a result driven by its fast,
+co-designed fused CUDA kernels. Our code is available at [41].
+Acknowledgments
+We thank the anonymous reviewers and our shepherd for their
+insightful feedbacks. Michael Mitzenmacher was supported in part
+by grants NSF CNS-2107078 and NSF DMS-2023528. Ran Ben Basat
+was supported in part by the Google Research Scholar Award.
+
+===== PAGE 13 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+References
+[1] 2017. Ring all reduce. https://github.com/baidu-research/baidu-allreduce.
+(2017).
+[2] 2019. BFloat16: The secret to high performance on Cloud TPUs. https://cloud.
+google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-
+performance-on-cloud-tpus. (2019).
+[3] 2020. Accelerating HPC Applications with NVIDIA Nsight Compute Roofline
+Analysis. https://developer.nvidia.com/blog/accelerating-hpc-applications-with-
+nsight-compute-roofline-analysis. (2020).
+[4] 2020.
+JAX:
+High
+performance
+array
+computing.
+=https://docs.jax.dev/en/latest/index.html. (2020).
+[5] 2023. Mastering LLM Techniques: Inference Optimization. https://developer.nv
+idia.com/blog/mastering-llm-techniques-inference-optimization/. (2023).
+[6] 2023. Memory-Limited Layers User’s Guide. https://docs.nvidia.com/deeplearni
+ng/performance/dl-performance-memory-limited/index.html. (2023).
+[7] 2023. OCP Microscaling Formats (MX) Specification. https://www.opencompute.
+org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf. (2023).
+[8] 2024. Collective operations in NCCL. https://docs.nvidia.com/deeplearning/nccl/
+user-guide/docs/usage/collectives.html. (2024).
+[9] 2024. GGUF format. https://github.com/ggml-org/ggml/blob/master/docs/gguf
+.md. (2024).
+[10] 2024. How Meta trains large language models at scale. https://engineering.fb.c
+om/2024/06/12/data-infrastructure/training-large-language-models-at-scale-
+meta/. (2024).
+[11] 2024. NVIDIA Collective Communications Library (NCCL). https://developer.nv
+idia.com/nccl. (2024).
+[12] 2025. Advanced NVIDIA CUDA Kernel Optimization Techniques: Handwritten
+PTX. https://developer.nvidia.com/blog/advanced-nvidia-cuda-kernel-
+optimization-techniques-handwritten-ptx/. (2025).
+[13] 2025. NVFP4 Trains with Precision of 16-Bit and Speed and Efficiency of 4-Bit.
+https://developer.nvidia.com/blog/nvfp4-trains-with-precision-of-16-bit-and-
+speed-and-efficiency-of-4-bit/. (2025).
+[14] 2025. NVIDIA Blackwell Architecture Technical Brief. (2025). https://resources.
+nvidia.com/en-us-blackwell-architecture
+[15] Saurabh Agarwal, Hongyi Wang, Shivaram Venkataraman, and Dimitris Papail-
+iopoulos. 2022. On the utility of gradient compression in distributed training
+systems. Proceedings of Machine Learning and Systems 4 (2022), 652–672.
+[16] Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan Vojnovic. 2017.
+QSGD: Communication-efficient SGD via gradient quantization and encoding.
+Advances in neural information processing systems 30 (2017).
+[17] Youhui Bai, Cheng Li, Quan Zhou, Jun Yi, Ping Gong, Feng Yan, Ruichuan Chen,
+and Yinlong Xu. 2021. Gradient compression supercharged high-performance
+data parallel dnn training. In Proceedings of the ACM SIGOPS 28th Symposium on
+Operating Systems Principles. 359–375.
+[18] Ran Ben-Basat, Yaniv Ben-Itzhak, Gal Mendelson, Michael Mitzenmacher, Amit
+Portnoy, and Shay Vargaftik. 2026.
+A note on turboquant and the earlier
+drive/eden line of work. arXiv preprint arXiv:2604.18555 (2026).
+[19] Ran Ben-Basat, Yaniv Ben-Itzhak, Michael Mitzenmacher, and Shay Vargaftik.
+2024. Optimal and approximate adaptive stochastic quantization. Advances in
+Neural Information Processing Systems 37 (2024), 94265–94291.
+[20] Ran Ben Basat, Yaniv Ben-Itzhak, Michael Mitzenmacher, and Shay Vargaftik.
+2025. Better than Optimal: Improving Adaptive Stochastic Quantization Using
+Shared Randomness. Proceedings of the ACM on Measurement and Analysis of
+Computing Systems 9, 3 (2025), 1–44.
+[21] Ran Ben-Basat, William Kuszmaul, Michael Mitzenmacher, Amit Portnoy, and
+Shay Vargaftik. 2026. Quantizing With Randomized Hadamard Transforms:
+Efficient Heuristic Now Proven. arXiv preprint arXiv:2605.06014 (2026).
+[22] Ran Ben Basat, Michael Mitzenmacher, and Shay Vargaftik. 2021. How to Send
+a Real Number Using a Single Bit (And Some Shared Randomness). In 48th
+International Colloquium on Automata, Languages, and Programming (ICALP
+2021).
+[23] Ran Ben-Basat, Amit Portnoy, Gil Einziger, Yaniv Ben-Itzhak, and Michael Mitzen-
+macher. 2024. Accelerating Federated Learning with Quick Distributed Mean
+Estimation. In ICML.
+[24] Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Animashree
+Anandkumar. 2018. signSGD: Compressed optimisation for non-convex problems.
+In International Conference on Machine Learning. PMLR, 560–569.
+[25] Jiamin Cao, Yu Guan, Kun Qian, Jiaqi Gao, Wencong Xiao, Jianbo Dong, Binzhang
+Fu, Dennis Cai, and Ennan Zhai. 2024. Crux: Gpu-efficient communication
+scheduling for deep learning training. In Proceedings of the ACM SIGCOMM 2024
+Conference. 1–15.
+[26] Roberto L Castro, Andrei Panferov, Soroush Tabesh, Oliver Sieberling, Jiale
+Chen, Mahdi Nikdan, Saleh Ashkboos, and Dan Alistarh. 2025. Quartet: Na-
+tive FP4 Training Can Be Optimal for Large Language Models. arXiv preprint
+arXiv:2505.14669 (2025).
+[27] Mengzhao Chen, Wenqi Shao, Peng Xu, Jiahao Wang, Peng Gao, Kaipeng Zhang,
+Yu Qiao, and Ping Luo. 2024. EfficientQAT: Efficient Quantization-Aware Training
+for Large Language Models. arXiv preprint arXiv:2407.11062 (2024).
+[28] Xiaoqi Chen, Shay Vargaftik, and Ran Ben-Basat. 2024. When ML Training Cuts
+Through Congestion: Just-in-Time Gradient Compression via Packet Trimming.
+In Hotnets.
+[29] Weiwei Chu, Xinfeng Xie, Jiecao Yu, Jie Wang, Amar Phanishayee, Chunqiang
+Tang, Yuchen Hao, Jianyu Huang, Mustafa Ozdal, Jun Wang, Vedanuj Goswami,
+Naman Goyal, Abhishek Kadian, Andrew Gu, Chris Cai, Feng Tian, Xiaodong
+Wang, Min Si, Pavan Balaji, Ching-Hsiang Chu, and Jongsoo Park. 2025. Scaling
+Llama 3 Training with Efficient Parallelism Strategies. In Proceedings of the 52nd
+Annual International Symposium on Computer Architecture (ISCA ’25). Association
+for Computing Machinery. https://doi.org/10.1145/3695053.3731410
+[30] Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark
+Mao, Marc' aurelio Ranzato, Andrew Senior, Paul Tucker, Ke Yang, Quoc Le,
+and Andrew Ng. 2012. Large Scale Distributed Deep Networks. In Advances in
+Neural Information Processing Systems, F. Pereira, C.J. Burges, L. Bottou, and K.Q.
+Weinberger (Eds.), Vol. 25. Curran Associates, Inc. https://proceedings.neurips.cc
+/paper_files/paper/2012/file/6aca97005c68f1206823815f66102863-Paper.pdf
+[31] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2018. Bert:
+Pre-training of deep bidirectional transformers for language understanding. arXiv
+preprint arXiv:1810.04805 (2018).
+[32] Ning Ding, Yulin Chen, Bokai Xu, Yujia Qin, Zhi Zheng, Shengding Hu, Zhiyuan
+Liu, Maosong Sun, and Bowen Zhou. 2023. Enhancing Chat Language Models by
+Scaling High-quality Instructional Conversations. arXiv preprint arXiv:2305.14233
+(2023).
+[33] Ron Dorfman, Shay Vargaftik, Yaniv Ben-Itzhak, and Kfir Yehuda Levy. 2023. Do-
+CoFL: Downlink compression for cross-device federated learning. In International
+Conference on Machine Learning. PMLR, 8356–8388.
+[34] Gil Einziger, Benny Fellman, Roy Friedman, and Yaron Kassner. 2018. Ice buckets:
+Improved counter estimation for network measurement. IEEE/ACM Transactions
+on Networking 26, 3 (2018), 1165–1178.
+[35] Grattafiori et al. 2024. The Llama 3 Herd of Models. (2024). arXiv:cs.AI/2407.21783
+https://arxiv.org/abs/2407.21783
+[36] Jiawei Fei, Chen-Yu Ho, Atal N Sahu, Marco Canini, and Amedeo Sapio. 2021.
+Efficient sparse collective communication and its application to accelerate dis-
+tributed deep learning. In Proceedings of the 2021 ACM SIGCOMM 2021 Conference.
+676–691.
+[37] Maxim Fishman, Brian Chmiel, Ron Banner, and Daniel Soudry. 2025. Scaling
+FP8 Training to Trillion-Token LLMs. In International Conference on Learning
+Representations.
+[38] Kazuki Fujii, Taishi Nakamura, and Rio Yokota. 2024.
+Balancing Speed
+and Stability: The Trade-offs of FP8 vs. BF16 Training in LLMs.
+(2024).
+arXiv:cs.LG/2411.08719
+[39] Alexandru M. Gherghescu, Vlad-Andrei Bădoiu, Alexandru Agache, Mihai-
+Valentin Dumitru, Iuliu Vasilescu, Radu Mantu, and Costin Raiciu. 2024. I’ve Got
+99 Problems But FLOPS Ain’t One. In Proceedings of the 23rd ACM Workshop on
+Hot Topics in Networks (HotNets ’24). Association for Computing Machinery, New
+York, NY, USA, 195–204. https://doi.org/10.1145/3696348.3696893
+[40] Amir Gholami, Zhewei Yao, Sehoon Kim, Coleman Hooper, Michael W Mahoney,
+and Kurt Keutzer. 2024. Ai and memory wall. IEEE Micro 44, 3 (2024), 33–39.
+[41] Wenchen Han. 2026. Github code repository of DynamiQ artifact. https://github
+.com/CharlesHan24/DynamiQ. (2026).
+[42] Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, Brad Karp, and Ran Ben
+Basat. 2024. Beyond Throughput and Compression Ratios: Towards High End-to-
+end Utility of Gradient Compression. In Proceedings of the 23rd ACM Workshop
+on Hot Topics in Networks (HotNets ’24). Association for Computing Machinery,
+New York, NY, USA, 186–194. https://doi.org/10.1145/3696348.3696857
+[43] A Hedayat and Walter Dennis Wallis. 1978. Hadamard matrices and their appli-
+cations. The annals of statistics (1978), 1184–1238.
+[44] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn
+Song, and Jacob Steinhardt. 2020. Measuring massive multitask language under-
+standing. arXiv preprint arXiv:2009.03300 (2020).
+[45] Torsten Hoefler, Tommaso Bonato, Daniele De Sensi, Salvatore Di Girolamo,
+Shigang Li, Marco Heddes, Jon Belk, Deepak Goel, Miguel Castro, and Steve
+Scott. 2022. HammingMesh: a network topology for large-scale deep learning.
+In Proceedings of the International Conference on High Performance Computing,
+Networking, Storage and Analysis (SC ’22). IEEE Press, Article 11, 18 pages.
+[46] Changho Hwang, Taehyun Kim, Sunghyun Kim, Jinwoo Shin, and KyoungSoo
+Park. 2021. Elastic resource sharing for distributed deep learning. In 18th USENIX
+Symposium on Networked Systems Design and Implementation (NSDI 21). 721–739.
+[47] Yimin Jiang, Yibo Zhu, Chang Lan, Bairen Yi, Yong Cui, and Chuanxiong Guo.
+2020. A unified architecture for accelerating distributed {DNN} training in
+heterogeneous {GPU/CPU} clusters. In 14th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 20). 463–479.
+[48] Xiaoqi Jiao, Yichun Yin, Lifeng Shang, Xin Jiang, Xiao Chen, Linlin Li, Fang Wang,
+and Qun Liu. 2019. Tinybert: Distilling bert for natural language understanding.
+arXiv preprint arXiv:1909.10351 (2019).
+[49] Sai Praneeth Karimireddy, Quentin Rebjock, Sebastian Stich, and Martin Jaggi.
+2019. Error feedback fixes signsgd and other gradient compression schemes. In
+
+===== PAGE 14 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+International Conference on Machine Learning. PMLR, 3252–3261.
+[50] Soojeong Kim, Gyeong-In Yu, Hojin Park, Sungwoo Cho, Eunji Jeong, Hyeon-
+min Ha, Sanha Lee, Joo Seong Jeong, and Byung-Gon Chun. 2019. Parallax:
+Sparsity-aware data parallel training of deep neural networks. In Proceedings of
+the Fourteenth EuroSys Conference 2019. 1–15.
+[51] Diederik Kinga, Jimmy Ba Adam, et al. 2015. A method for stochastic optimization.
+In International conference on learning representations (ICLR), Vol. 5. California;.
+[52] Joonhyung Lee, Jeongin Bae, Byeongwook Kim, Se Jung Kwon, and Dongsoo Lee.
+2024. To FP8 and Back Again: Quantifying Reduced Precision Effects on LLM
+Training Stability. arXiv preprint arXiv:2405.18710 (2024).
+[53] Wonyeol Lee, Rahul Sharma, and Alex Aiken. 2023. Training with mixed-precision
+floating-point assignments. arXiv preprint arXiv:2301.13464 (2023).
+[54] Haoyu Li, Yuchen Xu, Jiayi Chen, Rohit Dwivedula, Wenfei Wu, Keqiang He,
+Aditya Akella, and Daehyeok Kim. 2024. Accelerating Distributed Deep Learning
+using Lossless Homomorphic Compression. arXiv preprint arXiv:2402.07529
+(2024).
+[55] Mu Li, David G Andersen, Jun Woo Park, Alexander J Smola, Amr Ahmed, Vanja
+Josifovski, James Long, Eugene J Shekita, and Bor-Yiing Su. 2014. Scaling dis-
+tributed machine learning with the parameter server. In 11th USENIX Symposium
+on operating systems design and implementation (OSDI 14). 583–598.
+[56] Minghao Li, Ran Ben Basat, Shay Vargaftik, ChonLam Lao, Kevin Xu, Michael
+Mitzenmacher, and Minlan Yu. 2024. {THC}: Accelerating Distributed Deep
+Learning Using Tensor Homomorphic Compression. In 21st USENIX Symposium
+on Networked Systems Design and Implementation (NSDI 24). 1191–1211.
+[57] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li,
+Adam Paszke, Jeff Smith, Brian Vaughan, Pritam Damania, et al. 2020. Pytorch
+distributed: Experiences on accelerating data parallel training. arXiv preprint
+arXiv:2006.15704 (2020).
+[58] Llama Team, AI @ Meta. 2024. The Llama 3 Herd of Models. arXiv preprint
+arXiv:2407.21783 (2024).
+https://doi.org/10.48550/arXiv.2407.21783
+arXiv:cs.AI/2407.21783
+[59] Ilya Loshchilov and Frank Hutter. 2017. Decoupled weight decay regularization.
+arXiv preprint arXiv:1711.05101 (2017).
+[60] Ahmed M Abdelmoniem, Ahmed Elzanaty, Mohamed-Slim Alouini, and Marco
+Canini. 2021. An efficient statistical-based gradient compression technique for
+distributed training systems. Proceedings of Machine Learning and Systems 3
+(2021), 297–322.
+[61] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. 2016.
+Pointer sentinel mixture models. arXiv preprint arXiv:1609.07843 (2016).
+[62] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley,
+Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti,
+Julie Bernauer, Bryan Catanzaro, Amar Phanishayee, and Matei Zaharia. 2021.
+Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-
+LM. In Proceedings of the International Conference for High Performance Computing,
+Networking, Storage and Analysis (SC ’21). Association for Computing Machinery.
+https://doi.org/10.1145/3458817.3476209
+[63] NVIDIA. 2026.
+NVIDIA ConnectX-7 400G Adapters: Datasheet.
+NVIDIA
+Datasheet. (2026). https://www.nvidia.com/content/dam/en-zz/Solutions
+/networking/infiniband/connectx-7-datasheet.pdf Accessed: 2026-06-17.
+[64] NVIDIA. 2026. NVIDIA ConnectX-7 Adapter Cards User Manual. NVIDIA
+Networking Documentation. (2026). https://networking-docs.nvidia.com/connec
+tx7hw Accessed: 2026-06-17.
+[65] NVIDIA. 2026. NVIDIA GB200 NVL72. NVIDIA Data Center Product Page. (2026).
+https://www.nvidia.com/en-us/data-center/gb200-nvl72/ Accessed: 2026-06-17.
+[66] Andrei Panferov, Jiale Chen, Soroush Tabesh, Roberto L Castro, Mahdi Nikdan,
+and Dan Alistarh. [n. d.].
+QuEST: Training Accurate LLMs over Highly-
+Compressed Weights and Activation. In Sparsity in LLMs (SLLM): Deep Dive
+into Mixture of Experts, Quantization, Hardware, and Inference.
+[67] Pitch Patarasuk and Xin Yuan. 2009. Bandwidth optimal all-reduce algorithms
+for clusters of workstations. J. Parallel and Distrib. Comput. 69, 2 (2009), 117–124.
+[68] Houwen Peng, Kan Wu, Yixuan Wei, Guoshuai Zhao, Yuxiang Yang, Ze Liu, Yifan
+Xiong, Ziyue Yang, Bolin Ni, Jingcheng Hu, et al. 2023. Fp8-lm: Training fp8
+large language models. arXiv preprint arXiv:2310.18313 (2023).
+[69] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. 2020. Zero:
+Memory optimizations toward training trillion parameter models. In SC20: Inter-
+national Conference for High Performance Computing, Networking, Storage and
+Analysis. IEEE, 1–16.
+[70] Bita Darvish Rouhani, Ritchie Zhao, Ankit More, Mathew Hall, Alireza Kho-
+damoradi, Summer Deng, Dhruv Choudhary, Marius Cornea, Eric Dellinger,
+Kristof Denolf, et al. 2023. Microscaling data formats for deep learning. arXiv
+preprint arXiv:2310.10537 (2023).
+[71] Amedeo Sapio, Marco Canini, Chen-Yu Ho, Jacob Nelson, Panos Kalnis,
+Changhoon Kim, Arvind Krishnamurthy, Masoud Moshref, Dan Ports, and Pe-
+ter Richtárik. 2021. Scaling distributed machine learning with {In-Network}
+aggregation. In 18th USENIX Symposium on Networked Systems Design and Imple-
+mentation (NSDI 21). 785–808.
+[72] Daniele De Sensi, Tommaso Bonato, David Saam, and Torsten Hoefler. 2024.
+Swing: Short-cutting Rings for Higher Bandwidth Allreduce. In 21st USENIX
+Symposium on Networked Systems Design and Implementation (NSDI 24). USENIX
+Association, Santa Clara, CA, 1445–1462. https://www.usenix.org/conference/ns
+di24/presentation/de-sensi
+[73] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le,
+Geoffrey Hinton, and Jeff Dean. 2017. Outrageously large neural networks: The
+sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538 (2017).
+[74] Sebastian U Stich, Jean-Baptiste Cordonnier, and Martin Jaggi. 2018. Sparsified
+SGD with memory. Advances in neural information processing systems 31 (2018).
+[75] Ananda Theertha Suresh, Ziteng Sun, Jae Ro, and Felix Yu. 2022. Correlated
+quantization for distributed mean estimation and optimization. In International
+Conference on Machine Learning. PMLR, 20856–20876.
+[76] Zhenheng Tang, Zichen Tang, Junlin Huang, Xinglin Pan, Rudan Yan, Yuxin Wang,
+Amelie Chi Zhou, Shaohuai Shi, Xiaowen Chu, and Bo Li. 2025. DreamDDP:
+Accelerating Data Parallel Distributed LLM Training with Layer-wise Scheduled
+Partial Synchronization. (2025). arXiv:cs.DC/2502.11058 https://arxiv.org/abs/25
+02.11058
+[77] Gemma Team, Aishwarya Kamath, Johan Ferret, Shreya Pathak, Nino Vieillard,
+Ramona Merhej, Sarah Perrin, Tatiana Matejovicova, Alexandre Ramé, Morgane
+Rivière, et al. 2025. Gemma 3 technical report. arXiv preprint arXiv:2503.19786
+(2025).
+[78] Rajeev Thakur, Rolf Rabenseifner, and William Gropp. 2005. Optimization of
+collective communication operations in MPICH. The International Journal of
+High Performance Computing Applications 19, 1 (2005), 49–66.
+[79] Albert Tseng, Tao Yu, and Youngsuk Park. 2025. Training LLMs with MXFP4.
+In Proceedings of The 28th International Conference on Artificial Intelligence and
+Statistics. 1630–1638.
+[80] Shay Vargaftik, Ran Ben Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben Itzhak,
+and Michael Mitzenmacher. 2022. Eden: Communication-efficient and robust
+distributed mean estimation for federated learning. In International Conference
+on Machine Learning. PMLR, 21984–22014.
+[81] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak,
+and Michael Mitzenmacher. 2021. Drive: One-bit distributed mean estimation.
+Advances in Neural Information Processing Systems 34 (2021), 362–377.
+[82] Thijs Vogels, Sai Praneeth Karimireddy, and Martin Jaggi. 2019. PowerSGD:
+Practical low-rank gradient compression for distributed optimization. Advances
+in Neural Information Processing Systems 32 (2019).
+[83] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel R
+Bowman. 2018. GLUE: A multi-task benchmark and analysis platform for natural
+language understanding. arXiv preprint arXiv:1804.07461 (2018).
+[84] Hongyi Wang, Scott Sievert, Shengchao Liu, Zachary Charles, Dimitris Papail-
+iopoulos, and Stephen Wright. 2018. Atomo: Communication-efficient learning
+via atomic sparsification. Advances in neural information processing systems 31
+(2018).
+[85] Ruizhe Wang, Yeyun Gong, Xiao Liu, Guoshuai Zhao, Ziyue Yang, Baining Guo,
+Zhengjun Zha, and Peng Cheng. 2025. Optimizing large language model train-
+ing using fp4 quantization. In Forty-second International Conference on Machine
+Learning.
+[86] Zhuang Wang, Haibin Lin, Yibo Zhu, and TS Eugene Ng. 2023. Hi-Speed DNN
+Training with Espresso: Unleashing the Full Potential of Gradient Compression
+with Near-Optimal Usage Strategies. In Proceedings of the Eighteenth European
+Conference on Computer Systems. 867–882.
+[87] Zhuang Wang, Xinyu Crystal Wu, Zhaozhuo Xu, and TS Eugene Ng. 2023. CUP-
+CAKE: A Compression Optimizer for Scalable Communication-efficient Dis-
+tributed Training. In Proceedings of the Sixth Conference on Machine Learning and
+Systems (MLSys’ 23). Proceedings of the Sixth Conference on Machine Learning
+and Systems (MLSys’ 23).
+[88] Ertza Warraich, Ali Imran, Annus Zulfiqar, Shay Vargaftik, Sonia Fahmy, and
+Muhammad Shahbaz. 2025. OptiNIC: A Resilient and Tail-Optimal RDMA NIC
+for Distributed ML Workloads. arXiv preprint arXiv:2512.22743 (2025).
+[89] Ertza Warraich, Omer Shabtai, Khalid Manaa, Shay Vargaftik, Yonatan Piasetzky,
+Matty Kadosh, Lalith Suresh, and Muhammad Shahbaz. 2025. {OptiReduce}:
+Resilient and {Tail-Optimal}{AllReduce} for Distributed Deep Learning in the
+Cloud. In 22nd USENIX Symposium on Networked Systems Design and Implemen-
+tation (NSDI 25). 685–703.
+[90] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai
+Li. 2017. Terngrad: Ternary gradients to reduce communication in distributed
+deep learning. Advances in neural information processing systems 30 (2017).
+[91] Zeyu Zhang, Haiying Shen, Shay Vargaftik, Ran Ben Basat, Michael Mitzen-
+macher, and Minlan Yu. 2025. Hack: Homomorphic acceleration via compression
+of the key-value cache for disaggregated llm inference. In Proceedings of the ACM
+SIGCOMM 2025 Conference. 1245–1247.
+[92] Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar,
+and Yuandong Tian. 2024. GaLore: Memory-Efficient LLM Training by Gradient
+Low-Rank Projection. In Forty-first International Conference on Machine Learning.
+https://openreview.net/forum?id=hYHsrKDiX7
+[93] Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar,
+and Yuandong Tian. 2024. GaLore: memory-efficient LLM training by gradient
+low-rank projection. In Proceedings of the 41st International Conference on Machine
+
+===== PAGE 15 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Learning (ICML’24). JMLR.org, Article 2528, 23 pages.
+[94] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu,
+Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, et al. 2023. Pytorch fsdp:
+experiences on scaling fully sharded data parallel. arXiv preprint arXiv:2304.11277
+(2023).
+A
+A Faster Solution for Variable Bitwidth
+Allocation
+We propose a faster solution that dynamically maintains and adjusts
+an approximate value of 𝑇𝑎,𝑏across training rounds, assuming that
+there are at most three possible bitwidths. We explain the algorithm
+for the setup used in DynamiQ’s prototype, where the allowed
+bitwidth is 𝑊= {2, 4, 8}. To accelerate the calculations, we avoid
+sorting the array of 𝐹𝑗values (which is needed by the algorithm
+described in Section 3.2) and instead calculate how many bits 𝑞𝑗
+each super-group 𝑗is quantized by the following equation:
+𝑞𝑗= 2
+clamp
+
+[1,3],
+j
+log2 (
+4
+log2 (512/17) log2 𝐹𝑗+𝑢)
+k
+.
+Recall that the thresholds need to satisfy 𝑇2,4 = 17/512 · 𝑇4,8 and
+the bandwidth constraint, which is𝑆·Í
+𝑗𝑞𝑗≤𝑑·¯𝑏. Here, ¯𝑏represents
+the overall bitwidth budget minus the per-entry bandwidth used
+for transmitting the metadata, etc.
+We now explain why this equation respects these constraints
+and how we determine 𝑢. For a constant 𝑢, let
+𝑧𝑗=
+4
+log2(512/17) log2 𝐹𝑗+ 𝑢.
+Observe that 𝑞𝑗= 2 if 𝑧𝑗< 4, 𝑞𝑗= 4 if 𝑧𝑗∈[4, 8) and 𝑞𝑗= 8
+if 𝑧𝑗> 8. Since 𝑇𝑎,𝑏is defined as the threshold for which super-
+groups 𝑗with 𝐹𝑗≥𝑇𝑎,𝑏are assigned with at least 𝑎bits and super-
+groups with 𝐹𝑗≤𝑇𝑎,𝑏are assigned with at most 𝑏bits, we have
+𝑇2,4 = 𝐹𝑗
+=⇒𝑧𝑗= 4 and 𝑇4,8 = 𝐹𝑗
+=⇒𝑧𝑗= 8. This yields the
+following equations:
+• 4 =
+4
+log2 (512/17) log2𝑇2,4 + 𝑢
+• 8 =
+4
+log2 (512/17) log2𝑇4,8 + 𝑢
+• 𝑆· Í
+𝑗𝑞𝑗≤𝑑· ¯𝑏
+Our goal is thus to adjust 𝑢via a binary search to satisfy the
+bitwidth constraint. That is, we decrease 𝑢if the calculated Í
+𝑗𝑞𝑗>
+𝑑· ¯𝑏in the current round, and vice versa. With 𝑢established, we
+can determine 𝑞𝑗.
+B
+Analysis with Different All-reduce Topologies
+Unlike many prior compression schemes [36, 56, 87, 90] that are
+designed for parameter-server-based aggregation [55], DynamiQ
+naturally supports different multi-hop all-reduce topologies. That
+includes two well-known all-reduce topologies, namely ring all-
+reduce [1] and butterfly all-reduce [78] (also known as the recursive
+doubling [78], as illustrated in Figure 13). We remark that compared
+with ring all-reduce, butterfly all-reduce typically achieves lower
+tail latency in large-scale DDP training systems [72].
+We further observe that deploying DynamiQ to butterfly all-
+reduce also improves scalability with respect to its compression
+error as 𝑛grows larger. The intuition is that the compression er-
+ror at each hop is proportional to the values of the partial sum
+being transmitted, which is in turn proportional to the size of the
+corresponding subtree if gradients on different workers follow the
+Non­uniform Quantization
+Uniform Quantization
+10 4
+10 3
+vNMSE
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+(a) LLaMA MMLU 8b
+10 2
+10 1
+vNMSE
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+(b) LLaMA MMLU 4b
+10 1
+100
+vNMSE
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+(c) LLaMA MMLU 2b
+10 4
+10 3
+vNMSE
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+(d) Gemma Chat 8b
+10 2
+10 1
+vNMSE
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+(e) Gemma Chat 4b
+10 1
+100
+vNMSE
+0.2
+0.4
+0.6
+0.8
+1.0
+CDF
+(f) Gemma Chat 2b
+Figure 12: Compression error comparisons measured in vNMSE [81]
+per super-group between non-uniform quantization and uniform
+quantization. Each super-group uses 2, 4, or 8 bits per coordinate,
+and we plot the CDFs for each bit width separately.
+0
+1
+2
+3
+4
+5
+6
+7
+0 →1
+2 →3
+0123 →4567
+01 →23
+4 →5
+6 →7
+45 →67
+Figure 13: Butterfly all-reduce topology for a specific gradient chunk.
+Each color represents concurrent transmissions.
+same distribution. Figure 13 illustrates this claim: worker 3, with
+a subtree size of 4, compresses the partial sum of worker 0 ∼3’s
+gradients and transmits it to worker 7, which holds the partial sum
+of workers 4 ∼7.
+We now heuristically analyze the compression error with ring
+all-reduce and butterfly all-reduce. For this analysis, we use the
+sum of the expected mean squared error (MSE) at each worker.
+We assume that the gradient data 𝑋𝑖,𝑗[𝑘] indexed at 𝑘of the 𝑗’th
+super-group at worker 𝑖is bounded by 𝑀= max𝑖,𝑘|𝑋𝑖,𝑗[𝑘]|. It can
+be derived that the MSE for compressing the partial sum gradient
+𝑠𝑖,𝑗at worker 𝑖is bounded by MSE ≤𝜖𝑆max𝑘|𝑠𝑖,𝑗[𝑘]|2. We note
+that max |𝑠𝑖,𝑗[𝑘]| ≤𝑀|subtree(i)| where |subtree(𝑖)| is the subtree
+size rooted at worker 𝑖. Thus, with ring all-reduce, the expected
+worst-case MSE can be bounded by
+MSE ≤
+∑︁
+𝑖
+𝜖𝑆𝑖2𝑀2 = 𝑂(𝜖𝑆𝑀2𝑛3),
+while that of butterfly all-reduce is
+MSE ≤
+∑︁
+𝑙≤log𝑛
+𝜖𝑆(𝑀2𝑙)2 · (𝑛/2𝑙) = 𝑂(𝜖𝑆𝑀2𝑛2).
+That is, our upper bound on the MSE for the butterfly is a factor of
+𝑛less than that for the ring.
+
+===== PAGE 16 =====
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+Wenchen Han, Shay Vargaftik, Michael Mitzenmacher, and Ran Ben Basat
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+0.0
+0.5
+1.0
+1.5
+Time (h)
+3.1
+3.2
+3.3
+3.4
+3.5
+3.6
+Perplexity
+(a) BERT-large MaskedLM
+0
+2
+4
+Time (h)
+3.08
+3.13
+3.18
+3.23
+Perplexity
+(b) Gemma 1B Chat
+0
+2
+4
+Time (h)
+3.00
+3.05
+3.10
+3.15
+3.20
+Perplexity
+(c) LLaMA 1B Chat
+0
+1
+2
+3
+Time (h)
+60
+65
+70
+75
+Accuracy (%)
+(d) LLaMA 1B MMLU
+Figure 14: Zoomed-out TTA curves for LLM training and fine-tuning on an 8-GPU/4-worker testbed using ring all-reduce.
+BF16
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+0
+2
+4
+6
+Time (h)
+3.08
+3.13
+3.18
+3.23
+Perplexity
+(a) Gemma 1B Chat
+0
+1
+2
+3
+4
+5
+Time (h)
+60
+65
+70
+75
+Accuracy (%)
+(b) LLaMA 1B MMLU
+Figure 15: Zoomed-out TTA curves over a shared network.
+BF16
+MXFP8
+MXFP6
+MXFP4
+DynamiQ
+0
+1
+2
+3
+Time (h)
+60
+65
+70
+75
+Accuracy (%)
+Figure 16: Zoomed-out TTA (LLaMA 1B MMLU) for butterfly all-
+reduce.
+0
+500
+1000
+1500
+2000
+Time (ms)
+0
+10
+20
+30
+40
+50
+60
+70
+Bandwidth Usage (Gbps)
+BF16
+DynamiQ
+MXFP8
+Figure 17: Bandwidth usage over time for the LLaMA 1B MMLU
+workload with ring all-reduce.
+C
+Additional Experimental Setup
+Adaptation of Omnireduce to ring all-reduce. As noted, Om-
+nireduce (OR) was originally tailored for parameter-server archi-
+tectures. Specifically, OR employs chunked Top-𝑘compression,
+where each worker selects and aggregates its local top-𝑘gradient
+chunks. In a single-hop parameter-server architecture, this is easily
+achieved by having workers send their local top-𝑘chunks directly
+to the server. However, in multi-hop all-reduce, the local top-𝑘
+chunk indices can differ across workers; consequently, the number
+of aggregated chunks in an intermediate hop can exceed 𝑘. This
+leads to increased communication overhead, as more than 𝑘chunks
+may need to be transmitted per hop. To address this, we propose
+an adaptation that computes the union of indices appearing in at
+least one worker’s local top-𝑘selection. We refer to these as the
+global top-𝐾chunks, where 𝐾/𝑛chunks = 𝑏/16 (i.e., both equal to the
+desired compression ratio). Given a fixed 𝐾, it is challenging to di-
+rectly determine the required local 𝑘because it varies dynamically
+with the gradient distribution. We therefore propose a heuristic to
+approximate 𝑘. In each round 𝑡, given 𝑘𝑡, we compute the actual
+number of global chunks, 𝐾′
+𝑡, obtained from the union of work-
+ers’ local top-𝑘𝑡chunks. We then use the ratio 𝐾/𝐾′
+𝑡to adjust 𝑘𝑡+1
+so that 𝐾′
+𝑡matches the target 𝐾. We update 𝑘𝑡+1 according to the
+following momentum-based rule, where 0 ≤𝛾≤1 represents the
+momentum (set to 𝛾= 0.8 in our experiments):
+𝑘𝑡+1 = 𝛾𝑘𝑡+ (1 −𝛾) · (𝐾/𝐾′
+𝑡) · 𝑘𝑡
+(1)
+Adaptation of microscaling floating-point compression (MXFPX)
+to all-reduce. As the specification of microscaling floating-point
+formats (i.e., MXFP8, MXFP6, MXFP4) [7] does not define the sum-
+mation arithmetic required for all-reduce, we follow the FP8-LM [68]
+implementation to adapt MXFPX. The algorithm maintains a param-
+eter 𝜇, initialized as 𝑛, which controls the scaling factors for quantiz-
+ing BF16 gradients to MXFPX. In each round, we first compute, on
+each worker 𝑖and for each chunk 𝑗, the maximum absolute value
+𝑚𝑖,𝑗of the gradient chunk. These values are all-reduced across work-
+ers to obtain the global maximum 𝑔𝑚𝑗= max𝑖(𝑚𝑖,𝑗). We then deter-
+mine the global scaling factor of the chunk as 𝑠𝑗= 𝜇·𝑔𝑚𝑗, such that
+the original gradient 𝑔𝑖,𝑗is quantized as 𝑔′
+𝑖,𝑗= (𝑔𝑖,𝑗/𝑠𝑗) · FPX_MAX,
+where FPX_MAX is the largest value representable by MXFPX. The
+quantized 𝑔′
+𝑖,𝑗is then aggregated via all-reduce. The choice of 𝜇is
+critical: a smaller 𝜇leads to more overflows as 𝑔′
+𝑖,𝑗becomes larger,
+while a larger 𝜇causes underflows. We thus adopt the automatic
+scaling technique proposed in FP8-LM to dynamically update 𝜇. If
+the overflow ratio exceeds a threshold 𝜖, 𝜇is updated to 2𝜇in the
+next training step. Conversely, if the overflow ratio remains smaller
+than 𝛾, we decrease 𝜇to 𝛾𝜇, where 0 < 𝛾< 1 and 𝛾is chosen to be
+close to 1.
+D
+Additional Evaluation Results
+Zoomed-out end-to-end TTA curves. While Figures 5, 8, and 9
+in the main text present zoomed-in versions of the time-to-accuracy
+(TTA) curves for ring and butterfly all-reduce, we provide the full
+zoomed-out versions in Figures 14, 15, and 16, respectively. These
+full-scale plots illustrate how each method progresses from an
+
+===== PAGE 17 =====
+DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce
+SIGCOMM ’26, August 17–21, 2026, Denver, CO, USA
+MXFP8
+MXFP6
+MXFP4
+OR
+THC
+DynamiQ
+0
+2000 4000 6000 8000 10000
+# steps
+10 2
+10 1
+vNMSE
+(a) BERT-large MaskedLM
+0
+2000 4000 6000 8000 10000
+# steps
+10 3
+10 2
+10 1
+vNMSE
+(b) Gemma 1B Chat
+0
+2000 4000 6000 8000 10000
+# steps
+10 3
+10 2
+10 1
+vNMSE
+(c) LLaMA 1B Chat
+0
+2000 4000 6000 8000 10000
+# steps
+10 3
+10 2
+10 1
+vNMSE
+(d) LLaMA 1B MMLU
+Figure 18: vNMSE comparison over different workloads on our 8-GPU/4-worker testbed with ring all-reduce.
+Empirical Distribution
+LogNormal (K=1)
+Mixture of Two LogNormals (K=2)
+10−7
+10−4
+10−1
+102
+ℓ2 norm per super­group
+0.0
+0.5
+1.0
+CDF
+Figure 19: Empirical distribution of per-super-group ℓ2 norms com-
+pared with CDFs fitted using mixtures of LogNormal distributions.
+Here for 𝐾= 1: 𝜋1 = 1, 𝜇1 = −5.11, 𝜎1 = 3.14 and for 𝐾= 2:
+𝜋1 = 0.79, 𝜋2 = 0.21, 𝜇1 = −3.99, 𝜇2 = −16.41, 𝜎1 = 1.22, 𝜎2 = 4.63.
+initial low accuracy toward the BF16 baseline (depicted by dashed
+horizontal lines) over time. Furthermore, the full versions confirm
+that the converged accuracies shown in the zoomed-in plots remain
+stable over extended periods without further improvement.
+Bandwidth usage over time. Figure 17 illustrates bandwidth
+usage over time during the training of LLaMA 1B on MMLU. It
+distinguishes between active computation during the forward pass
+and network communication during overlapped backpropagation
+and gradient aggregation. The curves are periodic, with each period
+representing one training round. This clearly demonstrates that Dy-
+namiQ effectively reduces the time per training round (improving
+throughput) by minimizing communication overhead: while the
+computation intervals remain consistent across BF16, DynamiQ,
+and MXFP8, the communication intervals are significantly short-
+ened, indicating faster aggregation.
+Compression error curves over training steps. We also examine
+the evolution of vNMSE as training progresses, plotted in Figure 18.
+The results show that the vNMSE for DynamiQ and most baselines
+remains relatively steady, even as gradient distributions evolve
+during model convergence. Notably, Omnireduce (OR) shows an
+increase in vNMSE early in training. This suggests that gradient
+sparsity decreases as training progresses, making OR’s fixed-ratio
+sparsification less effective and leading to higher compression er-
+rors.
+E
+Synthesizing Data for Large-scale Simulation
+We generate the magnitude 𝑀G of each super-group G by fitting a
+mixture of LogNormal distributions to the empirical distribution
+of super-group ℓ2 norms shown in Figure 1(c). Specifically, for a
+mixture with 𝐾∈N+ components, we define
+𝜙(𝑥;𝜃) =
+𝐾
+∑︁
+𝑘=1
+𝜋𝑘LogNormal(𝑥| 𝜇𝑘, 𝜎𝑘),
+(2)
+where
+𝜃=
+
+{𝜋𝑘}𝐾
+𝑘=1, {𝜇𝑘}𝐾
+𝑘=1, {𝜎𝑘}𝐾
+𝑘=1
+
+,
+𝜋𝑘≥0, 𝜎𝑘> 0, and Í𝐾
+𝑘=1 𝜋𝑘= 1. Thus, the mixture has 3𝐾−1 free
+parameters.
+Because the empirical magnitudes span several orders of magni-
+tude, we fit 𝜃by minimizing the squared discrepancy between the
+empirical and fitted CDFs over a logarithmic scale:
+min
+𝜃
+∫log𝑥max
+log𝑥min
+ ˆ𝐹(𝑒𝑡) −𝐹𝜃(𝑒𝑡)
+2 𝑑𝑡,
+(3)
+where ˆ𝐹is the empirical CDF, 𝐹𝜃is the CDF corresponding to𝜙(·;𝜃),
+and [𝑥min,𝑥max] is the observed range of magnitudes.
+Figure 19 compares fits obtained using one and two LogNormal
+components. The two-component mixture closely reproduces the
+empirical distribution, so we use 𝐾= 2 and sample 𝑀G ∼𝜙(·;𝜃)
+when generating the synthetic data.
