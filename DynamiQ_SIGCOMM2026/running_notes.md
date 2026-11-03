@@ -1,7 +1,7 @@
 # DynamiQ: Accelerating Gradient Synchronization using Compressed Multi-hop All-reduce — 分析笔记
 
 > 分析进度：Phase 1-2 完成（2026-09-08）。§1 引言翻译已展示，精炼笔记为初稿，**待用户 review 确认**；确认后继续 §2 逐章翻译。
-> 目录：/home/dxl/Academics/DynamiQ_SIGCOMM2026/（DynamiQ_SIGCOMM2026.pdf + page_*.txt + fulltext.txt）
+> 目录：/home/dxl/Academics/DynamiQ_SIGCOMM2026/（DynamiQ_SIGCOMM2026.pdf + .pages/fulltext.txt + .pages/page_*.txt）
 
 ## 0. 论文概述
 

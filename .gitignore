@@ -1,0 +1,19 @@
+# Obsidian 运行时状态（频繁变动，不入库）
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache
+.dsh-cache/
+.trash/
+
+# 插件依赖（体积大、可重装）
+.obsidian/plugins/*/node_modules/
+
+# 逐页提取正文（可随时从 PDF 重新生成，仅用于核对）
+.pages/
+
+# 系统噪声
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+~$*
