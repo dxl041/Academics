@@ -1,0 +1,656 @@
+# Ordered Chaos 论文分析笔记
+
+> 论文：Ordered Chaos: Towards Adaptive Multipath Load Balancing with Precise Fast Loss Detection
+> 会议：SC'26（Supercomputing 2026，2026-11-15~20，Chicago, Illinois, USA）｜arXiv:2610.41707v1 (cs.NI, 2026-10-30)
+> 原文：/home/dxl/Academics/OrderedChaos/OrderedChaos.pdf（14 页，正文约 10 页）
+> 作者：Tommaso Bonato, Ahmad Ghalayini, Nadeen Gebara, Benoit Pit-Claudel, Jiayong Li, Mikhail Khalilov, Luca Piccolboni, Waleed Reda, Pei-Huan Tsai, Tao Ji, Abdul Kabbani, Torsten Hoefler
+> 单位：ETH Zurich（SPCL）· Microsoft · MIT · Columbia University
+
+---
+
+## 论文一页版总结
+
+### 基本信息
+- **标题**: Ordered Chaos: Towards Adaptive Multipath Load Balancing with Precise Fast Loss Detection
+- **会议**: SC'26（2026-11-15~20，Chicago）；arXiv 预印本 2610.41707v1
+- **作者**: 一作 Tommaso Bonato（ETH Zurich SPCL + Microsoft，博士生）；Torsten Hoefler（ETH Zurich，SPCL 负责人）；工业侧 Abdul Kabbani（Microsoft）；共 12 人、4 家机构
+
+### 一句话标题
+ETH 与微软用"保序子流喷洒 + 探针"，在单 RTT 内精确判定丢包。
+
+### 主要观点（3 行）
+- AI/HPC 万卡训练对丢包极敏感，而保序方案（ECMP）路径利用粗、逐包喷洒（RPS）又毁掉丢包检测所需的序信号。
+- 只保留"恰好够用的序"：把每条流确定性地切成 16 个保序子流做细粒度喷洒，每次只重路由最差的子流（RSS）。
+- 用子流内 PSN 缺口 + 尾部/周期/重传探针，在接收端确定性地把乱序与真丢分开（PFLD），无需交换机支持。
+
+### [洞察]
+论文真正的方法论贡献不是"又一种喷洒"，而是把**包序（ordering）当成一种可计价资源**来设计：σ 决定"保留多少序 / 兑换多少路径熵"，PFLD 负责把这笔序变现为确定性丢包判定——即把最贵的网络事件（丢包）从"时间推断"改成"结构推断"。这个"序预算（ordering budget）"轴可以迁移到任何乱序传输上。代价是这笔交易依赖两个隐含契约：端主机可控制 EV，且同一 EV 的包严格走同一物理路径。一旦网络侧自适应路由（AR）介入改写路径，序契约失效，PFLD 的确定性立刻退化为启发式。
+
+### AS-IS（背景 / 问题 / 现有方案）
+- **背景**：万卡级 AI 训练与紧耦合 HPC 作业持续数周，传输层丢包检测与恢复速度直接进入 time-to-result；生产统计中交换机间/卡间丢包（含静默丢包与链路损坏后丢弃）占性能异常相关丢包的 ~18%，定位平均耗时 161 分钟；端到端丢包率常态 10^-5 ~ 10^-4。
+- **趋势**：业界已从"每流选路"转向"逐包喷洒"（Ultra Ethernet、Falcon、SRD、ConnectX-8 / BlueField-3），接受乱序交付以换取利用率。
+- **问题**：逐包喷洒摧毁了传输层赖以快速判丢的序信号——端点无法区分"真丢"与"只是被延迟的包"。DPU 只能用硬件位图 + 每 QP 的 gap 定时器兜底，最终靠 RTO。
+- **现有不足**：
+  1. ECMP / PLB：保序但哈希静态、粒度粗、对非对称与故障反应慢；
+  2. RPS / REPS：利用率高但完全没有序信号；
+  3. packet trimming（NDP/CP/DCP）：能近即时通知**排队后**的拥塞丢包，但 corruption drop 发生在 PHY/MAC、入队之前，根本没有被 trim 的包头发给接收端；
+  4. RACK-TLP：发送端启发式，需等一个 RTT，且子流上包稀疏时判断退化。
+- **本质矛盾**：细粒度负载均衡 ↔ 快速判丢 ↔ 纯端主机可部署，三者难以同时满足。
+
+### TO-BE（方案 / 效果 / 不足 + 高价值研究点）
+- **方案**：RSS = 每流按 `seq mod σ` 轮询映射到 σ 个子流，每个子流用独立 EV（16-bit 源端口 / IPv6 flow label / UE entropy 字段）钉住一条物理路径，因而**子流内严格保序**；每 τ（≈1 RTT）汇一次反馈，只把 RTT/ECN 最差的**一个**子流换 EV（"离散转向"而非 MPTCP 式速率调节），带随机抖动防止全局同步。PFLD = 接收端维护每流 512-bit 位图，EV 直接编码该 ordered section 的起始 PSN（`EV = low16(PSN)`，低 log2σ 位仍标识子流），于是缺口即丢包、立即可 NACK；再用尾部探针（尾包丢）、周期探针（连续丢包）、重传探针（RTX 不连续）补齐三个盲区。
+- **效果**：微基准尾 FCT 最多 3×（incast P99 约为 ECMP 一半、tornado P99 2.5×）；RTO 减少 99%（all-to-all 0.08 次/run vs 其他方案 >22 万次）；ring all-reduce 加速 ~35%；LLaMA-7B 暴露通信时间 -28%；Google RPC 大消息中位 FCT -41%；HPC（ICON/LAMMPS/MILC）尾 FCT 最多 1.6× 优于 RACK-TLP，但整体运行时仅 1~2% 收益。
+- **不足**：全规模结果全部来自 htsim 单包仿真（corruption 建模为独立随机丢包）；DPU 原型仅 loopback、无拥塞、用 1 s 超时，只能证"逻辑可实现"；依赖乱序 RDMA 栈与可写 EV，AR fabric 下契约不成立；σ=16 固定、每子流仅 4096 个 EV，存在哈希极化风险；与 trimming 同时开启时 PFLD 的 RTO 反而升到 49.51 次/run（疑似双信号互相干扰），论文未解释。
+- **高价值研究点**：① 序预算的闭环自适应（σ、探针频率随流量节奏与拥塞态调）；② AR fabric 下的"序契约"形式化与违约检测；③ 与 MRC / UE 这类原生多路径可控乱序栈的共存与信号去重；④ RSS 与未修改的 ECMP 流共存时的公平性与哈希极化。
+
+---
+
+## 0. 摘要
+
+**EN:**
+Load balancing in best-effort datacenter fabrics faces a tradeoff. Order-preserving schemes such as Equal-Cost Multipath (ECMP) retain loss semantics but use path diversity coarsely, while packet spraying balances load well but removes the ordering signals needed for fast, precise loss detection. We present Ordered Chaos, an end-host design that preserves enough structure for reliable loss detection without giving up fine-grained multipath routing. Reactive Subflow Spraying (RSS) divides each flow into ordered, dynamically routed subflows. Precise Fast Loss Detection (PFLD) combines this ordering with probes to distinguish reordering from congestion, corruption, tail, and retransmission losses within one RTT. Across simulations, AI and HPC workloads, and a DPU prototype, RSS+PFLD improves tail flow completion time by up to 3×, eliminates up to 99% of timeout-based recoveries, and accelerates collective and training communication by up to 35%.
+
+**CN:**
+尽力而为（best-effort）数据中心网络中的负载均衡面临一个取舍。ECMP 这类保序方案保留了丢包语义，但对路径多样性的利用很粗；逐包喷洒虽然负载均衡效果好，却抹掉了快速、精确判丢所需的序信号。本文提出 Ordered Chaos——一种端主机侧设计，它在不放弃细粒度多路径路由的前提下，保留了足以可靠判丢的结构。反应式子流喷洒（RSS）把每条流切分成若干有序、可动态选路的子流；精确快速丢包检测（PFLD）把这种序与探针结合起来，在一个 RTT 内区分"乱序"与拥塞、损坏、尾部、重传四类丢包。在仿真、AI 与 HPC 负载以及 DPU 原型上的结果表明：RSS+PFLD 把尾流完成时间最多改善 3×，消除最多 99% 的基于超时的恢复，并把集合通信与训练通信加速最多 35%。
+
+> 精炼：摘要给出三段式——(1) 保序 vs 喷洒的两难；(2) RSS 造序、PFLD 用序；(3) 量化收益（3× / 99% / 35%）。三个数字分别是尾延迟、恢复机制、集合通信三个维度，注意它们来自不同实验，不是同一场景的叠加。
+
+---
+
+## 1. 引言（§I）
+
+**EN:**
+Large-scale AI training and tightly-coupled HPC workloads occupy tens of thousands of accelerators for weeks to months, making the transport layer's ability to detect and recover from packet losses a direct factor in time-to-result and cluster efficiency. At scale, these environments experience packet loss due to transient congestion, tail drops, failures, and persistent packet corruption arising from aging optics, hardware faults, and link degradation. Production measurements report that inter-switch and inter-card loss events, which include silent packet drops and packets discarded after link corruption, account for about 18% of packet drops associated with network performance anomalies, and end-to-end loss ratios in the range of 10^-5 to 10^-4 have been consistently reported within datacenters. These losses compound across multi-hop paths, stalling collectives, desynchronizing bulk-synchronous phases, and increasing training costs.
+
+**CN:**
+大规模 AI 训练与紧耦合 HPC 负载会占用数万个加速器、持续数周到数月，因此传输层检测并恢复丢包的能力，直接决定"出结果时间"与集群效率。在这样的规模上，丢包来自瞬时拥塞、尾部丢弃、故障，以及由光模块老化、硬件错误、链路劣化引起的持续性包损坏。生产测量显示：交换机间与卡间的丢包事件（包括静默丢包与链路损坏后被丢弃的包）约占与网络性能异常相关的丢包的 18%；数据中心内端到端丢包率长期处于 10^-5 至 10^-4 区间。这些丢包在多跳路径上累积放大，导致集合通信停滞、BSP（整体同步并行）阶段失步，并推高训练成本。
+
+**EN:**
+In practice, most datacenter fabrics attempt to exploit this path diversity using per-flow load-balancing mechanisms, with Equal-Cost Multipath (ECMP) serving as the dominant starting point. ECMP hashes a flow's five-tuple to select a single path for its lifetime. While simple and order-preserving, ECMP's hash-based static mapping can lead to collisions that over-subscribe some links while under-utilizing others, and its lack of adaptivity prevents effective response to asymmetric conditions, congestion, or failures. Reactive flow-level schemes such as PLB reduce persistent collisions through occasional rerouting, but still operate at coarse, per-flow granularity, limiting their ability to fully utilize available path diversity.
+
+**CN:**
+实践中，多数数据中心网络试图用"按流"的负载均衡来利用这些路径多样性，ECMP 是最主流的起点。ECMP 对流的五元组做哈希，在整个流生命周期内固定选一条路径。它简单、保序，但基于哈希的静态映射会造成碰撞：一些链路被超额订阅、另一些被闲置；同时缺乏自适应性，无法有效应对非对称、拥塞或故障。PLB 这类"反应式按流"方案通过偶发重路由缓解持续碰撞，但仍工作在粗粒度的流级别，无法充分利用路径多样性。
+
+**EN:**
+To overcome these limitations, the ecosystem has increasingly converged on multipath spraying, shifting from per-flow path selection to much finer-grained packet-level traffic distribution across paths. Correspondingly, industry efforts such as Ultra Ethernet, Falcon, SRD, and the NVIDIA ConnectX-8 and BlueField-3 NICs all adopt out-of-order-capable transports with per-packet spraying or other fine-grained load balancing mechanisms.
+
+**CN:**
+为克服这些限制，生态正在向多路径喷洒收敛——从"按流选路"转向细得多的"按包分发"。相应地，Ultra Ethernet、Falcon、SRD，以及 NVIDIA ConnectX-8 与 BlueField-3 网卡，都采用了支持乱序交付、带逐包喷洒或其他细粒度负载均衡的传输机制。
+
+**EN:**
+However, packet spraying destroys the ordering signals that traditional transports rely on for fast loss recovery: an endpoint cannot immediately distinguish between a true loss and a delayed packet. To manage this without the prohibitive memory cost of per-packet timers, modern DPUs like BlueField-3 employ hardware-resident bitmaps and per-Queue Pair (QP) gap timers. While these end-to-end timers eventually detect all losses, including those caused by corruption, they do so without the benefit of explicit network signaling. Consequently, some recent systems are starting to rely on switch-side packet trimming for near-instant congestion notification. Critically, because corruption drops typically occur at the PHY/MAC layer before a packet is queued, the switch cannot generate a trim notification. This leaves best-effort transports to rely on the expiration of conservative hardware timeouts, which, while functional for detection, introduce significant tail latency (P99) spikes compared to the rapid recovery seen in congestion-induced drops.
+
+**CN:**
+然而，逐包喷洒摧毁了传统传输层赖以快速恢复的序信号：端点无法立刻区分"真丢包"与"被延迟的包"。为了在不付出"逐包定时器"这种不可接受的内存代价的前提下应对这一点，BlueField-3 这类现代 DPU 使用硬件维护的位图和"每队列对（QP）的 gap 定时器"。这些端到端定时器最终能检出所有丢包（包括损坏导致的），但得不到网络显式信令的帮助。于是近期一些系统开始依赖交换机侧的 packet trimming 来做近即时的拥塞通知。关键在于：corruption drop 通常发生在 PHY/MAC 层、包还没入队，交换机根本无法生成 trim 通知。于是尽力而为传输只能等保守的硬件超时到期——这虽然能完成检测，但相比拥塞丢包时的快速恢复，会在 P99 尾延迟上造成显著尖峰。
+
+**EN:**
+Based on these observations, we propose Ordered Chaos, a unified, host-based load balancing and loss-recovery system for AI training and tightly-coupled HPC collectives. The key insight behind Ordered Chaos is that preserving just enough ordering structure enables fast, deterministic loss signaling without sacrificing the utilization benefits of fine-grained multipathing. Building on this insight, Ordered Chaos introduces two novel and synergistic contributions: Reactive Subflow Spraying (RSS) and Precise Fast Loss Detection (PFLD).
+
+**CN:**
+基于上述观察，我们提出 Ordered Chaos——一个统一的、纯端主机的负载均衡与丢包恢复系统，面向 AI 训练与紧耦合 HPC 集合通信。其核心洞见是：只要保留"恰好够用"的序结构，就能获得快速、确定性的丢包信令，同时不牺牲细粒度多路径带来的利用率收益。在此洞见之上，Ordered Chaos 包含两个新颖且互相增强的部件：反应式子流喷洒（RSS）与精确快速丢包检测（PFLD）。
+
+**EN:**
+RSS introduces a new operating point between per-flow hashing (e.g., ECMP/PLB) and per-packet spraying (e.g., RPS) by deterministically splitting each flow into σ logical subflows via round-robin mapping, such that each subflow carries a predictable packet subsequence. Rather than reacting at flow granularity, RSS periodically reroutes only the worst-performing subflow based on end-host congestion signals (e.g., RTT or ECN), achieving fine-grained adaptivity under asymmetry and failures while intentionally preserving in-order delivery within each subflow. PFLD exploits this preserved structure to enable a novel, receiver-driven loss recovery mechanism: by combining per-subflow sequence gaps with lightweight probes, PFLD deterministically distinguishes reordering from true loss and enables prompt recovery from congestion, corruption, tail, and retransmission losses without switch support or unbounded per-packet state. This receiver-driven, deterministic loss identification enables precise recovery actions and substantially reduces spurious or duplicate retransmissions compared to time-based, heuristic approaches.
+
+**CN:**
+RSS 在"按流哈希"（ECMP/PLB）与"逐包喷洒"（RPS）之间引入了一个新的工作点：用轮询映射把每条流确定性地切成 σ 条逻辑子流，使每条子流承载一段可预测的包子序列。它不在流粒度上反应，而是按周期只重路由表现最差的子流（依据端主机拥塞信号，如 RTT 或 ECN），从而在非对称与故障下获得细粒度自适应性，同时刻意保证**子流内**的有序交付。PFLD 利用这份被保留的结构，实现了一种新的接收端驱动的丢失恢复机制：把"子流内的序号缺口"与轻量探针结合，确定性地把乱序与真丢区分开，从而在无交换机支持、无无界逐包状态的前提下，快速从拥塞、损坏、尾部与重传丢包中恢复。相比基于时间的启发式方法，这种接收端驱动的确定性判丢能带来精确的恢复动作，并显著减少伪重传与重复重传。
+
+**EN:**
+Figure 1 illustrates how RSS preserves partial in-order delivery across subflows and how PFLD leverages this structure for fast and precise loss recovery. Panel A shows RSS on a symmetric and an asymmetric fat-tree topology with 16 subflows. In the asymmetric case, one of the 16 output links is throttled to 20% capacity; RSS reacts within microseconds, redistributing subflows so the degraded link carries proportionally fewer, converging to the ideal distribution (dotted lines). Panel B compares the 99th-percentile loss detection delay during an incast workload. With corruption drops (≈10^-5), RTO-based recovery takes 60–80 μs, and packet trimming cannot detect corruption drops because no trimmed header is produced. PFLD detects both congestion and corruption losses within a single RTT (< 20 μs). We define corruption drops as losses not caused by congestion.
+
+**CN:**
+图 1 展示了 RSS 如何在子流之间保留部分保序交付，以及 PFLD 如何利用该结构做快速精确的恢复。A 图是 16 条子流下、对称与非对称 fat-tree 拓扑上的 RSS 表现：非对称场景中 16 条输出链路之一被限速到 20% 容量，RSS 在微秒级内反应，重新分配子流，使劣化链路承担按比例的更少流量，收敛到理想分布（虚线）。B 图比较 incast 负载下 99 分位的判丢延迟：存在 corruption drop（≈10^-5）时，基于 RTO 的恢复需要 60–80 μs，而 packet trimming 因为不会产生被 trim 的包头，根本无法检测损坏丢包；PFLD 则在单个 RTT 内（< 20 μs）同时检出拥塞与损坏丢包。本文把"非拥塞引起的丢包"统称为 corruption drop。
+
+**EN:**
+Overall, without any switch modifications, Ordered Chaos reduces the non-overlapped communication time of LLaMA-7B training by 28%, speeds up ring all-reduce by 35%, and improves tail flow completion time by up to 3× across AI collectives, HPC applications (ICON, LAMMPS, MILC), and microbenchmarks. Our main contributions are: Reactive Subflow Spraying (RSS) — a subflow-level reactive load-balancing mechanism that partitions each flow into a small number of strictly ordered subflows and periodically reroutes only the worst-performing subflow based on simple end-host signals (RTT or ECN), achieving near-uniform link utilization under asymmetric and dynamic conditions while requiring no switch modifications. Precise Fast Loss Detection (PFLD) — a receiver-driven loss detection mechanism that leverages subflow-level ordering to precisely detect and recover from congestion, tail, retransmission, and corruption losses without packet trimming, combining lightweight probe packets with packet-sequence-number (PSN)-aware entropy encoding to deliver fast and deterministic loss signals with minimal memory requirements. Unified transport co-design with minimal state — RSS and PFLD are co-designed so that ordered subflows provide the structural signal needed for precise end-host loss detection, while accurate and timely loss feedback enables RSS to react aggressively without hardware assistance; per-flow state stays small (a few per-subflow counters and a receiver bitmap). Evaluation at scale and on hardware — large-scale packet-level simulations over a best-effort fabric spanning AI collectives, end-to-end LLM training traces, and replayed HPC workloads, plus a programmable DPU prototype.
+
+**CN:**
+总体而言，在完全不改动交换机的情况下，Ordered Chaos 把 LLaMA-7B 训练中的非重叠通信时间降低 28%，ring all-reduce 加速 35%，并在 AI 集合通信、HPC 应用（ICON、LAMMPS、MILC）与微基准上把尾流完成时间最多改善 3×。主要贡献有四项：(1) **RSS**：子流级的反应式负载均衡，把每条流切成少量严格保序的子流，只按简单的端主机信号（RTT 或 ECN）周期性地重路由最差子流，在非对称与动态条件下达到近似均匀的链路利用率，且无需改交换机；(2) **PFLD**：接收端驱动的判丢机制，利用子流级序精确检出并恢复拥塞、尾部、重传与损坏丢包，不依赖 packet trimming；它把轻量探针包与"感知 PSN 的熵编码"结合，以极小内存给出快速、确定性的丢包信号；(3) **最小状态的传输协同设计**：RSS 与 PFLD 互为条件——保序子流提供判丢所需的结构信号，而准确及时的丢包反馈又让 RSS 可以激进反应而不需硬件协助；每流状态很小（每子流几个计数器 + 一个接收端位图）；(4) **大规模与硬件评估**：在尽力而为网络上的大规模逐包仿真，覆盖 AI 集合通信、端到端 LLM 训练 trace 与回放的 HPC 负载，并用可编程 DPU 原型验证可实现性。
+
+> 精炼：引言把问题定位得很准——不是"负载均衡不好"，而是"喷洒把判丢信号吃掉了，而 trimming 管不到入队前的损坏丢包"。三个数字（28% / 35% / 3×）分别对应 LLaMA 暴露通信、ring all-reduce、尾 FCT，读的时候要记住它们来自不同实验、不同丢包率（LLaMA 用 5×10^-4），不能相乘也不代表同一场景。
+
+---
+
+## 2. 动机（§II）
+
+**EN:**
+Multipath, out-of-order-capable transports are becoming the prevailing design choice, yet a fundamental tension remains unresolved. Existing multipath load balancing and transport schemes struggle to simultaneously deliver fine-grained load balancing, fast loss detection for both congestion- and corruption-induced drops, and end-host only deployability. Figure 2 summarizes the dominant multipath load-balancing approaches used in today's transports and highlights this tension: order-preserving designs such as ECMP and FlowBender (FB) underutilize path diversity and react slowly to asymmetry, whereas packet-spraying schemes such as Random Packet Spraying (RPS) and its adaptive variants (REPS/AR) achieve high utilization by sacrificing the ordering signals required for timely loss detection.
+
+**CN:**
+支持多路径、支持乱序的传输正在成为主流设计，但一个根本矛盾仍未解决。现有多路径负载均衡与传输方案难以同时做到三件事：细粒度负载均衡、对拥塞与损坏两类丢包都快速的判丢、以及纯端主机可部署。图 2 总结了当今传输中最主要的几类多路径负载均衡并凸显该矛盾：ECMP 与 FlowBender（FB）这类保序设计对路径多样性利用不足、对非对称反应慢；RPS 及其自适应变体（REPS/AR）这类逐包喷洒方案以牺牲"及时判丢所需的序信号"为代价换取高利用率。
+
+**EN:**
+We further observe that, perhaps counter-intuitively, per-packet spraying is not necessarily needed to achieve high load-balancing effectiveness (Section V-B). RSS leverages this insight by operating at subflow granularity, retaining most of the utilization benefits of packet-level spreading while preserving controlled ordering. At the same time, although packet trimming can rapidly signal congestion-induced losses, it provides no notification for corruption drops, which occur before queueing. This limitation motivates the combination of ordered subflows (RSS) with fast, end-host loss detection (PFLD). In the remainder of this section, we characterize the prevalence and impact of corruption drops in production and explain why packet trimming, despite its effectiveness for congestion, is insufficient for fast loss recovery in this setting.
+
+**CN:**
+我们进一步观察到（也许有违直觉）：要获得良好的负载均衡效果，**未必**需要逐包喷洒（见 §V-B）。RSS 正是利用这一点——在子流粒度上工作，既拿到逐包扩散的大部分利用率收益，又保留了可控的序。另一方面，packet trimming 虽能快速通知拥塞导致的丢包，却对入队前发生的 corruption drop 无能为力。这一限制促使我们把"保序子流（RSS）"与"快速端主机判丢（PFLD）"组合起来。本节余下部分刻画生产环境中 corruption drop 的普遍性与影响，并说明为什么 trimming 虽对拥塞有效，却不足以支撑本场景下的快速恢复。
+
+### 2.1 生产环境中的损坏丢包（§II-A）
+
+**EN:**
+Large-scale AI training and HPC jobs run for days to months across tens of thousands of links. At this scale, both systemic failures (link flaps, switch failures, routing changes) and random corruption drops are the norm: production AI clusters report 5K to 60K link-flap incidents per day, and corruption drops caused by aging optics, bit errors, connector degradation, and ASIC glitches occur continuously across such large deployments.
+
+**CN:**
+大规模 AI 训练与 HPC 作业要在数万条链路上连续跑数天到数月。在这个尺度上，系统性故障（链路翻转、交换机故障、路由变更）与随机损坏丢包都是常态：生产 AI 集群报告每天 5K–60K 起链路翻转事件；而由光模块老化、比特错误、连接器劣化、ASIC 故障引起的损坏丢包，在如此大的部署中持续发生。
+
+**EN:**
+Production measurements report that inter-switch and inter-card loss events, which include silent packet drops and packets discarded after link corruption, account for about 18% of packet drops associated with network performance anomalies. These events take about 161 minutes to locate on average and account for half of the packet drops whose localization takes more than 180 minutes.
+
+**CN:**
+生产测量显示：交换机间与卡间的丢包事件（含静默丢包与链路损坏后被丢弃的包）约占与网络性能异常相关的丢包的 18%；这类事件平均需要约 161 分钟才能定位，并且在"定位耗时超过 180 分钟"的丢包中占一半。
+
+**EN:**
+Corruption compounds across multi-hop paths. If the per-link corruption probability is p_link and a path traverses h links, the end-to-end failure rate is p_end = 1 − (1 − p_link)^h ≈ h · p_link for small p_link. For instance, with a per-link corruption rate of 5×10^-5 (the rate we adopt for our evaluation, consistent with reported values) and a typical 6-hop datacenter path, the end-to-end loss probability is roughly 3×10^-4. This aligns with measurement studies that consistently report end-to-end loss ratios in the 10^-5 to 10^-4 range under normal operation, with localized degradations transiently pushing affected links into the 10^-3 to 10^-2 range before quarantine or repair.
+
+**CN:**
+损坏在多跳路径上累积。设单链路损坏概率为 p_link、路径经过 h 跳，则端到端失败率为 p_end = 1 − (1 − p_link)^h ≈ h·p_link（p_link 较小时）。例如取单链路损坏率 5×10^-5（本文评估采用的取值，与已报道数值一致）、典型 6 跳数据中心路径，则端到端丢包概率约 3×10^-4。这与测量研究一致：正常运行时端到端丢包率在 10^-5~10^-4，而局部劣化会在隔离或修复前把受影响链路瞬时推到 10^-3~10^-2。
+
+**EN:**
+These failure rates mean the network is almost always experiencing some fault or recovery event. Transports must remain effective under persistent change rather than only in steady state, making robust loss detection and recovery mechanisms critical for maintaining cluster efficiency.
+
+**CN:**
+这样的失败率意味着：网络几乎总处在某种故障或恢复过程中。传输层必须"在持续变化中"仍然有效，而不是只在稳态下有效——这使得鲁棒且快速的判丢/恢复机制成为维持集群效率的关键。
+
+### 2.2 为什么 trimming 不够（§II-B）
+
+**EN:**
+To mitigate packet loss in the presence of reordering, packet trimming has been proposed: when a switch queue is full or reaches a threshold, the incoming data packet's payload is stripped and the remaining header is pushed into a high-priority queue. The receiver sends a NACK upon receiving a trimmed header, prompting the sender to retransmit.
+
+**CN:**
+为在乱序环境下缓解丢包，人们提出了 packet trimming：当交换机队列满或达到阈值时，剥掉到达数据包的载荷，只把包头推入高优先级队列；接收端收到被 trim 的包头后回 NACK，促使发送端重传。
+
+**EN:**
+Although trimming is being adopted in several recent best-effort protocols, due to its effectiveness in rapidly signaling congestion-induced losses, it has two fundamental limitations. First, many production deployments still lack trimming support entirely. Second, and more critically, corruption drops occur before a packet is queued at the switch, leaving no trimmed header to signal the loss. In such cases, transports without end-host loss detection must fall back to retransmission timeouts, delaying recovery by orders of magnitude relative to the round-trip time and directly increasing job completion times.
+
+**CN:**
+尽管 trimming 因能快速通知拥塞丢包而被若干近期尽力而为协议采纳，它有两条根本限制。第一，许多生产部署根本不支持 trimming。第二（更关键），corruption drop 发生在包入队交换机之前，根本没有被 trim 的包头去通知这次丢失。此时，没有端主机判丢能力的传输只能退回重传超时（RTO），恢复延迟比 RTT 高出数量级，直接拉长作业完成时间。
+
+**EN:**
+Credit-based flow control similarly prevents congestion drops but not corruption drops that occur at the PHY/MAC layer before queueing. On such lossless fabrics, PFLD's role narrows to detecting corruption and link failures, while RSS remains useful when the fabric exposes endpoint-controlled path selection.
+
+**CN:**
+基于信用的流控同理：它能避免拥塞丢包，但挡不住 PHY/MAC 层入队前发生的损坏丢包。在这类"无损"网络上，PFLD 的作用收窄为检测损坏与链路故障；而只要网络暴露端主机可控的选路能力，RSS 仍然有用。
+
+> 精炼：§II 的论证链条非常干净：**18% 的异常丢包 + 161 分钟定位 + 每天 5K–60K 次链路翻转 → 网络长期带故障运行 → 判丢速度=集群效率**；再由"入队前损坏"这一物理事实否掉 trimming 的普适性（而非否掉 trimming 本身）。这也解释了为什么本文不与 trimming 竞争，而是把它当可选优化（评估中 trim on/off 都测）。
+
+---
+
+## 3. RSS 设计（§III）
+
+**EN:**
+The RSS sender logic is detailed in Algorithm 1 and its defining characteristics are described next.
+
+**CN:**
+RSS 的发送端逻辑见算法 1，其定义性特征如下。
+
+### 3.1 子流喷洒（§III-A）
+
+**EN:**
+The RSS mechanism deterministically partitions a single flow into σ parallel subflows each representing a 1/σ fraction of the aggregate bandwidth. This can be seen in Figure 3 which jointly illustrates the operation of RSS and PFLD with σ = 4. The parameter σ serves as a programmable tuning knob for load-balancing granularity: while σ = 1 reverts to static ECMP, higher values approach the high-entropy benefits of per-packet spraying. In this work, we fix σ = 16 to balance path diversity with reordering overhead in high-radix fabrics.
+
+**CN:**
+RSS 确定性地把一条流切分为 σ 条并行子流，每条承担总带宽的 1/σ。图 3 以 σ = 4 同时展示了 RSS 与 PFLD 的运作。参数 σ 是负载均衡粒度的可编程旋钮：σ = 1 退化为静态 ECMP，σ 越大越接近逐包喷洒的高熵收益。本文固定 σ = 16，以在高 radix（高基数）网络中平衡路径多样性与乱序开销。
+
+**EN:**
+Unlike MPTCP, which necessitates independent state machines per subflow, RSS utilizes a shared flow state across all paths. Furthermore, while MPTCP achieves load balancing through fine-grained rate modulation (bits/s), RSS employs a discrete steering approach. By dynamically adjusting the number of subflows allocated to a specific physical path (see III-B), RSS provides reactive load balancing without the overhead of hardware rate-shapers or per-subflow timers.
+
+**CN:**
+与 MPTCP 需要为每条子流维护独立状态机不同，RSS 在所有路径上共享同一份流状态。并且，MPTCP 通过细粒度速率调节（bit/s）实现负载均衡，RSS 采用的是**离散转向**：动态调整分配给某条物理路径的子流数量（见 §III-B），从而无需硬件整形器或每子流定时器就能实现反应式负载均衡。
+
+**EN:**
+To ensure compatibility with existing network fabric, RSS steers subflows by manipulating the entropy value (EV) in packet headers to leverage standard ECMP hashing at switches. Consistent with prior work, we utilize the 16-bit source port, the IPv6 flow label, or the Ultra Ethernet entropy field as the entropy source.
+
+**CN:**
+为兼容既有网络，RSS 通过改写包头中的熵值（EV）来转向子流，从而复用交换机上标准的 ECMP 哈希。与前人工作一致，可用 16 位源端口、IPv6 flow label 或 Ultra Ethernet 的 entropy 字段作为熵源。
+
+**EN:**
+While subflow and flowlet abstractions are established in protocols like MPTCP and adaptive routing schemes, RSS introduces a deterministic mapping paradigm that eliminates the ambiguity inherent in traditional grouping. Unlike FlowBender's reactive, flow-level switching or the stochastic nature of gap-dependent flowlets, RSS provides a predictable, hardware-native sequence-to-path correspondence. By proactively partitioning the flow regardless of application-level "gaps," RSS creates the architectural foundation for PFLD, enabling fine-grained, low-latency loss detection without the overhead of tracking probabilistic reordering events.
+
+**CN:**
+子流与 flowlet 抽象在 MPTCP 与自适应路由中已有先例，但 RSS 引入了**确定性映射**范式，消除了传统分组方式固有的歧义。与 FlowBender 的按流反应式切换、或依赖间隔（gap）的 flowlet 的随机性不同，RSS 提供可预测的、硬件原生友好的"序号→路径"对应关系。它不等待应用层出现"空隙"而是主动划分流，从而为 PFLD 打下架构基础：无需跟踪概率性乱序事件，即可实现细粒度、低延迟的判丢。
+
+**EN:**
+In Algorithm 1, updateEv uses two EV encodings. For the power-of-two σ used here, let N = log2(σ). Plain RSS randomizes the upper bits to select a new path while retaining the subflow ID in the low N bits. PSN-based PFLD instead uses the low 16 bits of the first PSN after a reroute; because subflow s carries PSNs p for which p mod σ = s, the low N bits still identify the subflow while the EV also marks the start of its new ordered section (Section IV).
+
+**CN:**
+算法 1 中 updateEv 使用两种 EV 编码。对本文采用的 2 的幂 σ，令 N = log2(σ)：**纯 RSS** 随机化高位以选择新路径，低 N 位保留子流 ID；**PSN-based PFLD** 则用重路由后第一个包的 PSN 的低 16 位——由于子流 s 承载的正是满足 p mod σ = s 的 PSN，低 N 位仍能标识子流，同时这个 EV 还标记了该子流新有序段（ordered section）的起点（见 §IV）。
+
+### 3.2 反应式重路由（§III-B）
+
+**EN:**
+While PLB is limited to serial probing of a single path, RSS concurrently monitors σ paths to maintain a comprehensive view of network state. Unlike gap-dependent flowlet switching, which fails under the dense traffic typical of RDMA and AI collectives, RSS evaluates rerouting on a fixed schedule τ independent of traffic patterns. At the first feedback event at or after each deadline, the sender evaluates path-level metrics, such as average RTT or ECN marking fractions, and migrates the worst-performing subflow for which it collected samples. Since the EV determines the switch-level routing, updating this field enables near-instantaneous rerouting to a new physical path. This parallel, scheduled approach ensures high-radix fabric utilization even during periods of maximum link saturation.
+
+**CN:**
+PLB 只能对单条路径串行探测，RSS 则并行监控 σ 条路径，从而掌握网络状态的全貌。与依赖间隔的 flowlet 切换不同（后者在 RDMA 与 AI 集合通信典型的密集流量下会失效），RSS 按**固定周期 τ** 评估重路由，与流量模式无关。在每个截止时刻之后的第一次反馈事件到来时，发送端评估路径级指标（如平均 RTT 或 ECN 标记比例），并迁移"有样本的"子流中表现最差的那一条。由于 EV 决定交换机侧路由，改写该字段即可近乎瞬时切到新的物理路径。这种并行、定时的方式保证了即使链路饱和到极限，高 radix 网络仍被充分利用。
+
+**EN:**
+The update interval τ governs the stability and convergence of RSS as a control system. At flow creation, nextRerouteTime is initialized to the first update deadline. Algorithm 1 advances subsequent deadlines by τ plus a small random jitter. Path feedback is collected throughout each interval and reset after the rerouting decision. We recommend configuring τ as a function of the network RTT to ensure sufficient feedback, such as ECN marks or sample RTTs, is received before rerouting decisions are made. The jitter prevents global synchronization between independent flows, which can lead to periodic fabric oscillations. Setting τ too low risks rerouting from too few samples, while an excessively large τ increases convergence time and delays the response to transient hotspots. A deployment that must react to complete feedback loss can additionally schedule a no-feedback timer for each subflow.
+
+**CN:**
+更新间隔 τ 决定 RSS 作为控制系统的稳定性与收敛性。流创建时把 nextRerouteTime 初始化为第一个更新截止点；算法 1 每次把后续截止点推进 τ 再加一个小随机抖动。反馈在整个区间内累积，在重路由决策后清零。我们建议把 τ 设为网络 RTT 的函数，以确保在做决策前收到足够反馈（ECN 标记或 RTT 采样）。抖动用于防止独立流之间的全局同步——那会造成周期性的全网振荡。τ 太小会因样本过少而误判，τ 过大则收敛慢、对瞬时热点响应迟钝。若部署需要应对"反馈完全消失"，可为每条子流额外挂一个 no-feedback 定时器。
+
+### 3.3 RSS 的可部署性（§III-C）
+
+**EN:**
+RSS requires only end-host support; no changes to network devices are needed. Recent work likewise demonstrates endpoint-controlled, path-aware load balancing with standard Ethernet mechanisms in low-diameter networks. It requires an end-host-settable path selector and endpoint support for out-of-order delivery across selectors while preserving order within each selector. Ethernet/RoCE exposes path selection through fields such as the UDP source port or IPv6 flow label, while Ultra Ethernet provides an entropy field. Slingshot, InfiniBand, and Omni-Path can provide the same abstraction when the NIC exposes equivalent path handles or entropy controls. The design is not applicable when a fabric hides all path choice or enforces strictly in-order endpoint delivery. Out-of-order-capable stacks are now available from cloud providers and in research prototypes.
+
+**CN:**
+RSS 只需端主机支持，不需要改动网络设备；近期工作也证明了在低直径网络中可以用标准以太网机制实现端主机可控的路径感知负载均衡。它需要两个前提：端主机可写的"路径选择器"，以及端点支持"跨选择器乱序、选择器内部保序"。Ethernet/RoCE 可通过 UDP 源端口或 IPv6 flow label 暴露选路，Ultra Ethernet 提供 entropy 字段；Slingshot、InfiniBand、Omni-Path 在网卡暴露等价路径句柄或熵控制时也能提供同样抽象。若网络完全隐藏路径选择、或强制端到端严格保序，则本设计不适用。支持乱序的协议栈目前已在云厂商产品与研究原型中出现。
+
+**EN:**
+RSS has a small, O(σ) memory footprint. The implementation maintains an entropy value, feedback count, accumulated RTT, maximum RTT, and ECN count per subflow, plus the next-update timestamp. A hardware implementation can instantiate only the accumulators required by its selected metric; the mean-RTT configuration in Algorithm 1, for example, needs only the entropy, feedback count, and accumulated RTT vectors.
+
+**CN:**
+RSS 的内存开销为 O(σ)，很小。实现上每条子流维护：熵值、反馈计数、累计 RTT、最大 RTT、ECN 计数，外加一个下次更新时间戳。硬件实现可以只实例化所选指标需要的累加器——例如算法 1 的 mean-RTT 配置只需 entropy、feedback count、accumulated RTT 三个向量。
+
+> 精炼：RSS 的关键设计选择有三个，且每一个都直接服务于 PFLD：(1) **确定性轮询映射**（`seq mod σ`）让"PSN → 子流"可逆，PFLD 才能用低 N 位反解子流；(2) **EV 钉住物理路径**让"同 EV = 同路径 = 严格保序"，序才成为可信信号（前提：网络不插手中途换路）；(3) **每次只搬一条最差子流 + 抖动**把控制环的扰动压到最小，避免全网同步振荡。代价是反馈滞后 τ，且"只搬最差"在快速劣化时收敛慢于逐包自适应。
+
+---
+
+## 4. PFLD 设计（§IV）
+
+**EN:**
+While RSS results in out-of-order delivery across subflows, it preserves in-order delivery within each subflow. Since packets within a subflow sharing an EV are guaranteed to traverse the same physical path (Section III-B), they maintain strict sequential ordering relative to their specific subflow. PFLD leverages this deterministic structure for high-fidelity loss detection.
+
+**CN:**
+RSS 在子流之间造成乱序，但在每条子流内部保持有序。由于共享同一 EV 的包保证走同一条物理路径（§III-B），它们相对该子流保持严格顺序。PFLD 就利用这一确定性结构做高保真判丢。
+
+### 4.1 设计空间与 PSN-based PFLD（§IV-A）
+
+**EN:**
+We considered several PFLD variants with progressively smaller state requirements, summarized in Table I. An Infinite Memory design tracks every in-flight PSN per EV, detecting gaps immediately but requiring state proportional to the bandwidth-delay product, which is prohibitive on NICs. A Fixed Path variant constrains each subflow to a static EV with an arithmetic PSN subsequence, reducing state to one expected-PSN counter per path plus a single 512-bit per-flow bitmap; however, it cannot support rerouting. A Generation-Based extension adds expected-PSN counters for each concurrent generation of every subflow while retaining one per-flow bitmap.
+
+**CN:**
+我们考察了若干状态需求递减的 PFLD 变体（表 I）。**无限内存**版本按 EV 跟踪每个在途 PSN，能立即发现缺口，但状态量与 BDP（带宽时延积）成正比，在网卡上不可接受。**固定路径**版本把每子流钉在静态 EV 上、PSN 子序列呈等差，状态降为"每路径一个期望 PSN 计数器 + 每流一个 512-bit 位图"，但不支持重路由。**按代（Generation）**扩展为每子流的每个并发"代"各加一个期望 PSN 计数器，仍只保留一个每流位图。
+
+**EN:**
+PSN-Based PFLD is our proposed state-optimal scheme that eliminates the need for explicit generation tracking. The key insight is to encode the start of each rerouted section directly in the EV. When RSS reroutes a subflow, it sets the EV to the low 16 bits of the next PSN scheduled on that subflow. The first packet on the new path carries this EV. Because the value is derived from that packet's PSN rather than chosen randomly, the receiver can recover the section's start PSN without a separate handshake or explicit generation state. A single 512-bit bitmap per flow records the received status of each packet relative to this start. Because round-robin spraying maps PSN p to subflow p mod σ, the lower log2(σ) EV bits still identify the subflow. With σ = 16, the remaining 12 bits provide 4096 EVs per subflow. Generation PSNs vary across flows, message sizes, and reroutes; if two EVs collide on a poor path, RSS can reroute the affected subflow again.
+
+**CN:**
+**PSN-based PFLD** 是本文提出的状态最优方案，它消除了显式的"代"跟踪。核心洞见是：**把每个重路由段的起点直接编码进 EV**。当 RSS 重路由某子流时，把 EV 设为该子流下一个将发送的 PSN 的低 16 位，新路径上的第一个包携带该 EV。因为这个值源自该包的 PSN 而非随机选取，接收端无需额外握手或显式代状态即可恢复该段的起始 PSN。每流一个 512-bit 位图，记录各包相对该起点的接收状态。由于轮询喷洒把 PSN p 映射到子流 p mod σ，EV 的低 log2(σ) 位仍标识子流；σ = 16 时其余 12 位给出每子流 4096 个 EV。代 PSN 会随流、消息大小、重路由而变化；若两个 EV 在一条差路径上碰撞，RSS 可以再次重路由受影响的子流。
+
+**EN:**
+In the receiver-driven variant (Figure 4), PSNs are global: subflow s carries exactly those PSNs for which p mod σ = s, and each EV identifies the start of one ordered section of that subsequence. The receiver lifts the 16-bit EV into its current absolute-PSN window, computes the packet's bitmap offset, and marks the corresponding bit. Packets between the maximum received PSN index and the first unset bit are identified as lost and NACKed immediately for retransmission. Upon receiving NACKs, the sender enqueues the missing packets for retransmission.
+
+**CN:**
+在接收端驱动的变体中（图 4），PSN 是全局的：子流 s 承载的正是满足 p mod σ = s 的那些 PSN，每个 EV 标识该子序列中一个有序段的起点。接收端把 16 位 EV 抬升到当前的绝对 PSN 窗口中，算出该包的位图偏移并置位。**"已收到的最大 PSN 索引"与"第一个未置位比特"之间的包即判定为丢失**，立即 NACK 请求重传；发送端收到 NACK 后把缺失包入队重传。
+
+**EN:**
+Data placement is identical to RPS or another out-of-order transport and requires no separate reorder buffer: each packet carries its PSN and offset, so an out-of-order-capable RDMA stack places the payload directly at its final location. PFLD's per-flow bitmap is used only for loss detection. Running PFLD at the receiver provides two benefits. First, the receiver is the first endpoint with positive evidence of loss: a later packet or probe has arrived on the same ordered subflow while an earlier PSN has not. Second, it can immediately NACK the precise gap. A sender sees only missing ACKs, which may instead reflect ACK coalescing, ACK loss, or reverse-path delay and therefore require additional feedback or time-based thresholds such as RACK-TLP.
+
+**CN:**
+数据放置与 RPS 等乱序传输完全相同，不需要额外的重排缓冲：每个包自带 PSN 与偏移，支持乱序的 RDMA 栈可直接把载荷写到最终位置。PFLD 的每流位图只用于判丢。把 PFLD 放在接收端有两个好处：其一，接收端是**第一个拥有"丢失"正证据**的端点——同一有序子流上更靠后的包/探针到了，而更早的 PSN 没到；其二，它可以立即针对精确缺口发 NACK。发送端只看到"ACK 缺失"，而这可能是 ACK 合并、ACK 丢失或反向路径时延造成的，因此必须依赖额外反馈或 RACK-TLP 这类基于时间的阈值。
+
+**EN:**
+The required bitmap size is determined by the maximum unresolved PSN span in an active section and scales with rate, RTT, and packet size. At 400 Gb/s and 10 μs RTT, the NIC-wide BDP spans about 122 packets with a 4 KiB maximum transmission unit (MTU) and 489 packets with 1 KiB packets. We therefore use a 512-bit bitmap, which covers both cases; this choice sizes the tracking window rather than constraining PFLD correctness to a particular MTU. For 512-byte packets or larger BDPs, a deployment can use a larger bitmap, such as 1024 bits, or overlapping generations without changing the detection logic. When RSS reroutes a subflow, the sender emits a tail probe on the old EV to close the section as shown in Figure 3. The bitmap is indexed by absolute PSN and slides forward monotonically, so late-arriving packets on the old path are marked within the existing window. NACKs are scoped to each section's PSN range, preventing cross-section spurious retransmissions.
+
+**CN:**
+所需位图大小由"活跃段内未解决 PSN 的最大跨度"决定，随速率、RTT 与包长变化。在 400 Gb/s、10 μs RTT 下，整网卡 BDP 在 4 KiB MTU 时约 122 个包、1 KiB 包时约 489 个包，因此采用 512-bit 位图即可覆盖两者；这个选择只是确定跟踪窗口大小，并不把 PFLD 的正确性绑定到某种 MTU。对 512 字节包或更大 BDP，部署可改用 1024-bit 位图或重叠代，判丢逻辑不变。当 RSS 重路由某子流时，发送端在**旧 EV** 上发一个 tail probe 来"封段"（图 3）。位图以绝对 PSN 索引并单调前滑，因此在旧路径上迟到到达的包仍落在现有窗口内被标记。NACK 被限制在各段的 PSN 范围内，避免跨段伪重传。
+
+**EN:**
+Figure 5 shows the memory occupancy per NIC for all variants assuming a 400 Gb/s network with a 10 μs RTT and a 4 KiB MTU. PSN-Based PFLD requires less than 100 KiB even at 1000 active flows, while the Infinite Memory variant reaches about 480 KiB. The bitmap size can be adjusted based on deployment requirements and is not tied to the core RSS or PFLD design.
+
+**CN:**
+图 5 给出 400 Gb/s、10 μs RTT、4 KiB MTU 下各变体的单网卡内存占用：1000 条活跃流时，PSN-based PFLD 需要不到 100 KiB，而无限内存变体约 480 KiB。位图大小可按部署需求调整，不与 RSS/PFLD 核心设计耦合。
+
+### 4.2 用探针补齐可靠性（§IV-B）
+
+**EN:**
+PSN-based loss detection identifies drops whenever a subsequent packet arrives on the same subflow and reveals a gap. However, three corner cases require additional mechanisms: tail losses (no subsequent packet exists), prolonged loss bursts (detection waits indefinitely), and retransmission losses (non-sequential PSNs break gap detection). We address all three with lightweight probe packets shown in Figure 3.
+
+**CN:**
+PSN-based 判丢的前提是"同一子流上有后续包到达并暴露缺口"。但有三种边角情况需要额外机制：**尾部丢失**（没有后续包）、**持续丢包突发**（检测要无限期等待）、**重传丢失**（非连续 PSN 破坏缺口检测）。我们用图 3 所示的轻量探针包分别解决这三类问题。
+
+**EN:**
+1) Probe Packet for Tail Loss: The PSN-based gap mechanism alone cannot detect the loss of the last packet before an EV change or the last packet of a subflow, because no subsequent packet exists to reveal the gap. PFLD handles these cases with tail probes. With RSS, each message has multiple tail packets (one per subflow, plus additional ones at each reroute), so the sender appends a header-only tail probe after the last data packet on each subflow. The probe carries the last PSN that should have been received before it, allowing the receiver to NACK any missing PSNs up to and including that value.
+
+**CN:**
+1）**尾部探针**：仅靠缺口机制无法发现"EV 变更前的最后一个包"或"子流最后一个包"的丢失，因为后面没有包来暴露缺口。PFLD 用 tail probe 处理：在 RSS 下每条消息本来就有多个"尾包"（每子流一个，加上每次重路由各一个），因此发送端在每条子流的最后一个数据包之后附一个仅含包头的 tail probe，携带"原本应在它之前收到的最后一个 PSN"，接收端据此可对直到该值（含）的所有缺失 PSN 发 NACK。
+
+**EN:**
+2) Proactive Probing: The gap-based mechanism only detects losses after receiving a packet. If a burst of consecutive packets is lost, detection is delayed until after the RTO, causing spurious retransmissions. The sender prevents this with periodic proactive probes: header-only, low-priority packets that ensure PSN synchronization. Upon receiving a probe, the receiver NACKs any unreceived PSNs with the same EV. Probes are small and less likely to be dropped, and increase the chance of detecting losses before the RTO fires (Figure 6a).
+
+**CN:**
+2）**周期主动探针**：缺口机制只有在"收到包之后"才能发现丢失。若连续一串包被丢，检测会被拖到 RTO 之后，造成伪重传。发送端用周期性主动探针避免这一点：仅含包头、低优先级的包，用于维持 PSN 同步。接收端一收到探针，就对同一 EV 下所有未收到的 PSN 发 NACK。探针体积小、更不容易被丢，从而提高了"在 RTO 触发前发现丢失"的概率（图 6a）。
+
+**EN:**
+3) Retransmitted (RTX) Packet Probing: Retransmitted packets' PSNs don't respect expected sequential ordering. As a result, the receiver cannot identify if retransmitted packets are lost. This motivates accompanying each RTX packet with a per-packet RTX probe. This header-only probe carries the PSN of the retransmission. If the receiver receives the probe but not the corresponding data packet, it NACKs that PSN.
+
+**CN:**
+3）**重传探针（RTX probe）**：重传包的 PSN 不服从"预期顺序"，因此接收端无法判断重传包是否也丢了。为此给每个 RTX 包配一个逐包 RTX 探针（仅包头），携带该重传的 PSN；接收端若收到探针却没收到对应数据包，就对那个 PSN 发 NACK。
+
+**EN:**
+Probe loss affects latency, not correctness. If an RTX packet, probe, or NACK is lost, the sender falls back to the normal retransmission timeout. At a regular RSS update, Algorithm 1 considers only subflows that returned feedback during the current interval. A completely silent subflow is therefore rerouted only when the optional no-feedback timer described in Section III-B is enabled. Later packets or probes on an active section can expose earlier missing PSNs. Common losses are therefore detected before timeout, while pathological combinations remain RTO-bounded.
+
+**CN:**
+探针丢失影响的是延迟而非正确性：若 RTX 包、探针或 NACK 丢失，发送端退回常规 RTO。在每次 RSS 更新时，算法 1 只考虑本区间内返回过反馈的子流，因此"完全静默"的子流只有启用 §III-B 的可选 no-feedback 定时器时才会被重路由。活跃段上后续的包或探针可以暴露更早的缺失 PSN。于是：常见丢包在超时前被测出，病态组合则仍由 RTO 兜底。
+
+**EN:**
+4) Headroom Buffer for Probe Packets: Probe packets play an essential role in PFLD: they detect tail losses, synchronize state, and protect retransmissions. Although they are header-only packets and thus less likely to be dropped, they are enqueued with data packets and remain exposed to congestion. As an optional optimization, a deployment may reserve a small switch-buffer headroom for probes; it is not required for correctness or for the end-host-only design. Our evaluation shows that less than 0.2% of the low-priority queue is sufficient to avoid probe drops entirely (Figure 6b).
+
+**CN:**
+4）**探针的 headroom 缓冲**：探针在 PFLD 中不可或缺——检测尾部丢失、同步状态、保护重传。虽然它们只有包头、被丢概率更低，但仍与数据包同队入队、暴露在拥塞下。作为**可选优化**，部署可为探针预留少量交换机缓冲余量；这对正确性与"纯端主机"设计都不是必需。评估显示：低优先级队列不到 0.2% 的余量就足以完全避免探针被丢（图 6b）。
+
+> 精炼：PFLD 的优雅之处在于"用 EV 自描述段的起点"——把代管理（generation tracking）这个通常需要额外状态的维度，压进了既有的 16 位熵字段，于是状态从 O(#paths × #gens) 降到每流 512 bit。代价是 EV 空间被切薄（每子流 4096 个），且四种探针各自补一个语义漏洞，缺一不可：tail 补"没有后继包"、periodic 补"连续丢"、RTX 补"PSN 不连续"、headroom 补"探针自己被丢"。这也是论文被审稿人可能质疑的地方：探针语义虽清晰，但触发条件、频率与开销的耦合只在 §V-F 做了经验性消融，没有形式化保证。
+
+---
+
+## 5. 大规模仿真评估（§V）
+
+**EN:**
+We implement RSS and PFLD in the htsim simulator and run large-scale per-packet simulations.
+
+**CN:**
+我们在 htsim 模拟器中实现 RSS 与 PFLD，并进行大规模逐包仿真。
+
+### 5.1 方法与配置（§V-A）
+
+**EN:**
+We simulate a 2-tiered fat-tree topology with 1,024 nodes with 64-port switches. We set the MTU to 4 KiB and the latency of all links to 1.5 μs (i.e. a minimum RTT of 12 μs when traversing both tiers). We compare several network settings: a symmetric case with all links having 400 Gbps capacity, and an asymmetric case with 4 out of the 16 aggregate switches having all of their links reduced to 100 Gbps. The congestion control algorithm used is MPRDMA, which manages window-based congestion control on a per-flow basis. We replace only its path-selection logic with each evaluated scheme. Under RSS, MPRDMA's window is shared across all subflows; each subflow transmits at 1/σ of the aggregate rate, so RSS controls where packets go while MPRDMA controls how fast they are sent. Under ECMP and PLB, MPRDMA operates on a single path; under RPS and REPS, each packet is placed on a path independently.
+
+**CN:**
+仿真采用两层 fat-tree、1,024 个节点、64 端口交换机；MTU 4 KiB，所有链路时延 1.5 μs（跨两层的最小 RTT 为 12 μs）。比较两类网络配置：对称场景（所有链路 400 Gbps）与非对称场景（16 台汇聚交换机中的 4 台，其全部链路降为 100 Gbps）。拥塞控制使用 MPRDMA（按流做窗口式拥塞控制），我们只把它的选路逻辑替换为各被评方案。RSS 下 MPRDMA 的窗口在全部子流间共享，每子流以总速率的 1/σ 发送——即 RSS 管"往哪发"、MPRDMA 管"发多快"。ECMP/PLB 下 MPRDMA 工作在单路径；RPS/REPS 下每个包独立选路。
+
+**EN:**
+We configure the retransmission timeout (RTO) for each experiment based on the topology's maximum unloaded RTT, with additional allowance for queueing delay. Unless noted otherwise, we set the corruption drop rate to 5×10^-5 (Sec. II-A). We verified that our results hold qualitatively across rates from 10^-6 to 10^-4: lower rates reduce the absolute gap between schemes because fewer drops occur, while higher rates amplify PFLD's advantage because more losses require fast detection. The LLaMA experiment uses 5×10^-4, and the finite HPC trace replays use 5×10^-3 so that enough losses occur to compare recovery behavior.
+
+**CN:**
+每个实验的 RTO 依据该拓扑的最大空载 RTT 设定，并为排队时延留出余量。除特别说明外，corruption 丢包率取 5×10^-5（见 §II-A）。我们验证了结果在 10^-6~10^-4 范围内定性成立：丢包率越低，各方案绝对差距越小（丢得少）；丢包率越高，PFLD 的优势越被放大（更多丢包需要快速检测）。LLaMA 实验用 5×10^-4，有限长度的 HPC trace 回放用 5×10^-3，以保证有足够丢包来比较恢复行为。
+
+**EN:**
+Simulation Workloads: We use ATLAHS with htsim to simulate advanced workloads. The workloads are: Microbenchmarks — Incast (many-to-one) and Tornado (one-to-one but all going across the tree to stress the load balancing). AI-collectives — the most common collectives for synchronous AI training: all-reduce using the ring algorithm and all-to-all. End-to-end AI traces — ATLAHS collects end-to-end traces for a single training iteration of the LLaMA 7B model. HPC application traces — MPI traces from ICON (climate modeling), LAMMPS (molecular dynamics), and MILC (lattice QCD). Data center traces — flow sizes sampled from a Google RPC distribution at 80% offered load. Schemes: ECMP; PLB (ECN threshold 0.05, reroute every congestion period, parameters from Flowbender); Flowlet Switching; RPS; REPS; RACK-TLP (state-of-the-art sender-side loss recovery, RFC 8985, used in Linux and Google's datacenter stack), paired with RSS to approximate proprietary Falcon. For all other experiments we set the number of subflows to 16 and the update interval to 15 μs, roughly equal to the RTT.
+
+**CN:**
+仿真负载：**微基准**（Incast 多对一、Tornado 一对但全部穿过整棵树以压满负载均衡）；**AI 集合通信**（同步训练最常用的 ring all-reduce 与 all-to-all）；**端到端 AI trace**（用 ATLAHS 采集 LLaMA-7B 单次训练迭代的 trace）；**HPC 应用 trace**（ICON 气候模拟、LAMMPS 分子动力学、MILC 格点 QCD 的 MPI trace）；**数据中心 trace**（按 Google RPC 流长分布采样，80% 提供负载）。对照方案：ECMP；PLB（ECN 阈值 0.05、每拥塞周期重路由，参数沿用 Flowbender）；Flowlet Switching；RPS；REPS；**RACK-TLP**（RFC 8985，Linux 与 Google 数据中心栈在用）——与 RSS 搭配以逼近专有的 Falcon，从而在同一负载均衡下隔离"PFLD 接收端判丢 vs RACK-TLP 发送端启发式"的差异。其余实验统一取 σ = 16、更新间隔 τ = 15 μs（≈1 RTT）。
+
+### 5.2 微基准（§V-B）
+
+**EN:**
+We use a set of standard microbenchmarks to assess both load balancing performance and loss-detection reactivity. For each workload, we evaluate the performance with and without corruption drops. Each scheme is run with and without packet trimming. To account for randomness, we run each configuration 100 times with different random seeds and report violin plots over all flows across runs. In grey we also report a dotted line with the ideal completion time assuming perfect fairness.
+
+**CN:**
+我们用一组标准微基准同时评估负载均衡性能与判丢反应速度。每个负载都在"有/无 corruption drop"下评估，每个方案都跑"开/关 packet trimming"两种设置。为处理随机性，每个配置用 100 个不同随机种子各跑一次，并对所有流汇总画小提琴图；灰色虚线给出"完全公平"假设下的理想完成时间。
+
+**EN:**
+In Figure 7a, we showcase an 8:1 incast where each sender transmits 1 MiB to a receiver. As expected, with packet trimming enabled and no corruption drops, schemes with finer granularity, such as REPS, RSS, and RPS, perform best. However, once trimming is disabled, only RSS+PFLD maintains the same performance because it detects losses more quickly. With corruption drops enabled, the main advantage of PFLD becomes clear. Even with trimming, corruption drops remain problematic for the other schemes, and RACK-TLP has a delayed reaction, while PFLD reacts proactively to all kinds of drops. This makes the 99th-percentile FCT with RSS+PFLD roughly half that of ECMP. PFLD's probes add a small common-case overhead, which can make its median slightly higher than RACK-TLP's, but immediate receiver-side evidence provides the larger improvement at the tail.
+
+**CN:**
+图 7a 是 8:1 incast（每个发送端向接收端发 1 MiB）。如预期，在开启 trimming 且无 corruption drop 时，REPS、RSS、RPS 这些细粒度方案最好；但一旦关掉 trimming，只有 RSS+PFLD 维持同等性能，因为它的判丢更快。开启 corruption drop 后 PFLD 的主要优势显现：**即使开着 trimming**，corruption drop 仍然困扰其他方案，RACK-TLP 反应滞后，而 PFLD 对各类丢包都能主动反应——这使 RSS+PFLD 的 99 分位 FCT 约为 ECMP 的一半。PFLD 的探针在常见路径上带来少量额外开销，可能使其中位数略高于 RACK-TLP，但接收端"即时正证据"在尾部带来的改善更大。
+
+**EN:**
+Then, in Figure 7b, we focus on a Tornado pattern, where each node sends to and receives from its symmetric node in the other half of the tree. This ensures that all packets of all flows traverse the network, stressing the load balancer. The trends mirror the incast case: without corruption drops, RSS+PFLD is only slightly slower than per-packet schemes; when trimming is disabled and drops occur, RSS+PFLD gains a substantial lead, up to 2.5× at the 99th. Across both workloads, we also measured the total number of retransmission timeouts triggered. With PFLD, timeouts are reduced by 99% compared to ECMP, both with and without trimming. In practice, the only remaining timeouts with PFLD are edge cases such as lost NACKs or simultaneous loss of a probe and all its associated data packets. This confirms that PFLD's probing mechanisms effectively eliminate RTO as the dominant recovery path, which is the root cause of the tail latency improvements observed above.
+
+**CN:**
+图 7b 是 Tornado 模式：每个节点与树另一半中的对称节点互发，使所有流的所有包都穿过网络，最大化压测负载均衡器。趋势与 incast 一致：无 corruption drop 时 RSS+PFLD 仅略慢于逐包方案；关掉 trimming 且有丢包时，RSS+PFLD 取得显著领先，99 分位最多 2.5×。两个负载上我们还统计了触发的重传超时总数：无论开/关 trimming，PFLD 相比 ECMP 都把超时减少 99%。实践中 PFLD 仅剩的超时都是边角情形，如 NACK 丢失、或某个探针及其关联数据包同时被丢。这确认了 PFLD 的探针机制有效地把 RTO 从"主要恢复路径"中移除了——而那正是上述尾延迟改善的根因。
+
+### 5.3 AI 负载（§V-C）
+
+**EN:**
+We show simulated results for two commonly used collectives in AI training: the all-reduce implemented via the ring algorithm, and the all-to-all implemented using an algorithm where we limit the number of parallel connections per node. Later, we also use ATLAHS to run end-to-end training workloads using open-source traces.
+
+**CN:**
+我们给出 AI 训练中两种常用集合通信的仿真结果：ring 算法实现的 all-reduce、以及限制每节点并行连接数的 all-to-all。随后用 ATLAHS 与开源 trace 跑端到端训练负载。
+
+**EN:**
+In Figure 8, we show all-reduce performance with corruption drops. We omit results without corruption drops because they are indistinguishable on our fully provisioned topology. We run the all-reduce on 128 nodes 100 times and plot the distribution of collective completion times. PFLD and RACK-TLP outperform all other approaches because they provide an accurate loss-detection signal, yielding about a 35% speedup. Their median completion times are essentially identical; at the 99th percentile, RACK-TLP is marginally faster (about 4.1 ms versus 4.2 ms for PFLD).
+
+**CN:**
+图 8 是带 corruption drop 的 all-reduce。无 corruption drop 的结果被省略，因为在充分供给的拓扑上各方案难以区分。实验在 128 节点上跑 100 次，画集合通信完成时间分布。PFLD 与 RACK-TLP 因提供准确判丢信号而优于其他所有方案，加速约 35%；两者中位数几乎相同，在 99 分位上 RACK-TLP 略快（约 4.1 ms vs PFLD 4.2 ms）。
+
+**EN:**
+A more important benefit of PFLD is improved synchronization of the ring. Under ideal conditions, a ring all-reduce should not induce congestion. However, if a flow is slowed down, incast can arise and compound quickly. This is evident in Figure 9, which shows flow completion times over time for RSS with and without PFLD. With PFLD there is a clear pattern, with flows completing at a small set of values depending on hop count; without PFLD, the pattern is chaotic. Flows may time out, stalling part of the ring while other flows continue, which triggers incast and disrupts synchronization.
+
+**CN:**
+PFLD 更重要的收益是改善 ring 的同步性。理想情况下 ring all-reduce 不应引发拥塞，但只要某条流被拖慢，incast 就会出现并迅速放大。图 9 给出有/无 PFLD 时 RSS 的流完成时间随时间的分布：有 PFLD 时呈现清晰模式——流完成时间聚成少数几个值，随跳数分层；无 PFLD 时则是混乱的。流可能超时，使 ring 的一部分停住而其他部分继续，进而触发 incast 并破坏同步。
+
+**EN:**
+In Figure 10 we evaluate performance of all-to-all. Without corruption, per-packet load balancers perform slightly better than PFLD with trimming. However, without trimming, PFLD gets a 20% lead over the second-best algorithm with and without corruption drops. We also take a deeper look at RTO counts for the all-to-all experiment in Figure 11. RSS+PFLD averages only 0.08 RTOs per run without trimming and 49.51 with trimming, versus 149.42 and 132.49 for RSS+RACK-TLP. All other schemes exceed 221,000 RTOs per run. Thus, RSS+PFLD makes timeouts exceptional without trimming and remains well below RSS+RACK-TLP with trimming.
+
+**CN:**
+图 10 评估 all-to-all。无 corruption 时，逐包负载均衡器（配合 trimming）略优于 PFLD；但关掉 trimming 后，无论有无 corruption drop，PFLD 都比次优算法领先 20%。图 11 进一步看 all-to-all 的 RTO 次数：RSS+PFLD 在关 trimming 时平均仅 0.08 次/run、开 trimming 时 49.51 次/run，而 RSS+RACK-TLP 分别是 149.42 与 132.49；其他所有方案都超过 22.1 万次/run。也就是说，无 trimming 时 PFLD 让超时成为"例外"，有 trimming 时也远低于 RACK-TLP。
+
+**EN:**
+We also evaluate LLaMA 7B using the traces available at [49] in Figure 12. We measure the time to complete one training iteration and plot only the exposed communication portion since the network cannot improve the compute-heavy parts. Compared to ECMP, RSS+PFLD reduces exposed communication time by 28% and achieves a 10% improvement over REPS and RPS. Notably, while trimming improves the performance of single-path schemes, it provides little benefit for multipath schemes.
+
+**CN:**
+图 12 用公开 trace 评估 LLaMA-7B：测量单次训练迭代的耗时，但只画"暴露的通信部分"，因为网络无法改善重计算部分。相比 ECMP，RSS+PFLD 把暴露通信时间减少 28%，比 REPS/RPS 好 10%。值得注意的是：trimming 能改善单路径方案，但对多路径方案几乎没有帮助。
+
+### 5.4 HPC 负载（§V-D）
+
+**EN:**
+We evaluate RSS+PFLD on execution traces from representative HPC applications, replayed end-to-end under random corruption drops. In contrast to the synthetic tests, these traces expose smaller headroom for load-balancing gains: the standard load-balancing baselines remain relatively close in communication-only and end-to-end runtimes, while the tail FCT is significantly lower with loss recovery schemes. We report mean FCT and p99 FCT to show tail behavior, communication-only runtime to isolate the network effect, and end-to-end trace runtime to quantify the overall application impact. Across all workloads in Figure 13, RSS+PFLD is the fastest, with RACK-TLP being second. In MILC, the most communication-heavy workload, PFLD improves tail FCT by about 1.6× over RACK-TLP and communication-only runtime by up to 15% over ECMP.
+
+**CN:**
+我们在代表性 HPC 应用的执行 trace 上评估 RSS+PFLD，在随机 corruption drop 下端到端回放。与合成负载不同，这些真实 trace 给负载均衡留的余量更小：标准负载均衡基线在"纯通信时间"与"端到端运行时"上彼此接近，而尾 FCT 在有丢包恢复的方案下明显更低。我们报告平均 FCT、p99 FCT（尾部行为）、纯通信运行时（隔离网络效应）与端到端 trace 运行时（量化应用整体影响）。图 13 中所有负载上 RSS+PFLD 最快，RACK-TLP 第二。在通信最重的 MILC 上，PFLD 的尾 FCT 比 RACK-TLP 好约 1.6×，纯通信运行时比 ECMP 最多好 15%。
+
+### 5.5 数据中心 trace（§V-E）
+
+**EN:**
+We evaluate a workload based on Google RPC size distributions. We sample flow sizes from the empirical distribution, adjust interarrival times to reach 80% offered load, and simulate approximately 100,000 flows. Figure 16 groups results into 0 to 10 KB, 10 KB to 1 MiB, and larger than 1 MiB. For the smallest messages, medians and tails remain similar because a short flow rarely contains a corruption drop. With corruption drops, RSS+PFLD roughly halves the 99th-percentile FCT of 10 KB to 1 MiB messages relative to schemes without specialized recovery. For messages larger than 1 MiB, it lowers median FCT by about 41% relative to ECMP and remains competitive with RSS+RACK-TLP across both trimming settings.
+
+**CN:**
+我们基于 Google RPC 流长分布构造负载：按经验分布采样流长，调整到达间隔使提供负载达 80%，共仿真约 10 万条流。图 16 按 0–10 KB、10 KB–1 MiB、>1 MiB 分组。最小消息的中位数与尾部基本相近，因为短流很少包含 corruption drop。存在 corruption drop 时，对 10 KB–1 MiB 的消息，RSS+PFLD 把 99 分位 FCT 相对"无专门恢复机制"的方案大致减半；对 >1 MiB 的消息，中位 FCT 比 ECMP 低约 41%，并在两种 trimming 设置下都与 RSS+RACK-TLP 相当。
+
+### 5.6 参数敏感性（§V-F）
+
+**EN:**
+In Figure 14 we show the impact of RSS's update interval τ and number of subflows σ on the maximum FCT. In general, adding more subflows helps improve performance, but gains are limited after a certain point (e.g., 16/32 subflows). Counterintuitively, adding subflows can actually have a negative impact in certain cases: 1) More subflows require more state. 2) More subflows in RSS make the PFLD reaction time slower as each subflow might have few packets in-flight per RTT. 3) Increasing the number of subflows means that each subflow gets less information and RSS might make uninformed routing decisions. For τ, a small but reasonable (multiple of RTT) value is preferred for frequent updates.
+
+**CN:**
+图 14 给出 RSS 的更新间隔 τ 与子流数 σ 对最大 FCT 的影响。总体上子流越多性能越好，但超过某个点（如 16/32）后收益有限。有违直觉的是，子流增多在某些情况下反而有害：(1) 状态更多；(2) 子流越多，每子流每 RTT 在途包可能很少，PFLD 的反应反而变慢；(3) 子流增多使每条子流获得的信息变少，RSS 可能做出"不知情"的路由决策。对 τ，偏好"小但合理"（RTT 的若干倍）的取值以换取更频繁的更新。
+
+**EN:**
+We then run an ablation study, shown in Figure 15, to evaluate the impact of PFLD's different probe types and frequencies. For tornado traffic, section and tail probes halve RTO events from 112.8 to 56.7; periodic probes add little in this case, while retransmission probes eliminate the remaining exposed RTOs. Under 32:1 incast, periodic frequency matters: P = 16 remains near 2,600 RTO events, while P = 8, P = 4, and P = 1 reduce the mean to 1,300, 522.9, and 48.1, respectively; probing at most once per RTT yields 132.1. Each of the 16 subflows sends infrequently during this large incast, so ordinary data packets provide sparse ordering evidence and RTT probes are especially useful. Probe type and frequency could adapt dynamically to traffic pace and network conditions. Retransmission probes instead address the residual recovery failures in the tornado workload.
+
+**CN:**
+图 15 是 PFLD 各探针类型与频率的消融。Tornado 流量下，section + tail 探针把 RTO 从 112.8 减半到 56.7；周期探针在此场景几乎无增益，而重传探针消除了剩余暴露的 RTO。32:1 incast 下周期频率很关键：P = 16 时仍约 2,600 次 RTO，P = 8/4/1 分别把均值降到 1,300 / 522.9 / 48.1；"每 RTT 至多一次"得到 132.1。原因是这个大 incast 中 16 条子流各自发送都不频繁，普通数据包提供的序证据很稀疏，RTT 探针因此特别有用。探针类型与频率可以随流量节奏与网络状态动态调整；重传探针则用于解决 tornado 负载中残余的恢复失败。
+
+> 精炼：评估的组织方式值得学习——**每个微基准都做 2×2（corruption 有/无 × trimming 开/关）**，这一设计把"PFLD 的收益到底来自哪里"分离得很干净：trimming 开 + 无 corruption 时 PFLD 不占优（说明它不是在负载均衡上赢）；trimming 关 + 有 corruption 时 PFLD 大幅领先（说明赢在判丢）。三处需要记住的数字矛盾：① 摘要/引言的"3×"在微基准里实际是 ~2×（incast P99 减半）、tornado 2.5×；② all-reduce 上 PFLD 的 P99 反而略输 RACK-TLP（4.2 vs 4.1 ms）；③ trimming 打开后 PFLD 的 RTO 从 0.08 升到 49.51 次/run，论文未解释这一"双信令互相干扰"现象。
+
+---
+
+## 6. 硬件可行性验证（§VI）
+
+**EN:**
+To complement the large-scale simulation study, we validate the practical feasibility of PFLD's probing mechanisms on a programmable Data Processing Unit (DPU; specifications withheld for confidentiality). The goal of this prototype is not to replicate the full-scale evaluation of Section V, but to answer three research questions: (1) does PFLD's probing logic introduce measurable overhead on real hardware? (2) does the implementation produce spurious retransmissions? and (3) do the different probing variants (tail, retransmission, proactive) behave on hardware as predicted by simulation?
+
+**CN:**
+为补充大规模仿真，我们在可编程 DPU 上验证 PFLD 探针机制的实际可行性（规格因保密未披露）。该原型的目的不是复现 §V 的全规模评估，而是回答三个研究问题：(1) PFLD 的探针逻辑在真实硬件上是否带来可测开销？(2) 实现是否产生伪重传？(3) 各探针变体（尾部、重传、主动）在硬件上的行为是否与仿真预测一致？
+
+**EN:**
+Setup: We implement RSS and PFLD on the DPU's programmable data path, maintaining receiver-side loss-detection state and probe-generation logic in the DPU's memory. The prototype runs in loopback mode, continuously sending fixed-size messages (4 KiB to 1 MiB) for 20 seconds per configuration. This message range represents the lower end of typical data-plane traffic and is a conservative setting for overhead evaluation, since probing costs are amortized over fewer data packets.
+
+**CN:**
+**配置**：在 DPU 的可编程数据通路上实现 RSS 与 PFLD，把接收端判丢状态与探针生成逻辑放在 DPU 内存中。原型以 loopback 模式运行，每配置连续发送固定长度消息（4 KiB–1 MiB）20 秒。该消息长度范围代表典型数据面流量的低端，对开销评估是保守设置——因为探针成本只能摊到更少的数据包上。
+
+**EN:**
+Probing overhead is negligible: We compare a baseline RSS-only implementation against one incorporating PFLD's probing. As shown in Figure 17a, retransmission probes add zero overhead (as expected, since no drops occur in this experiment and hence no retransmission probes are generated). Tail probes add about 6% overhead for the smallest messages (4 KiB, where each message is a single MTU-sized packet), and converge to zero once messages exceed 128 KiB. This confirms that PFLD's probing is practical even on resource-constrained DPU hardware.
+
+**CN:**
+**探针开销可忽略**：把纯 RSS 基线与加入 PFLD 探针的实现对比。图 17a 显示：重传探针开销为零（预期如此——本实验无丢包，故不产生 RTX 探针）；尾部探针对最小消息（4 KiB，每条消息就是单个 MTU 包）带来约 6% 开销，消息超过 128 KiB 后趋近于零。这证明即使在资源受限的 DPU 硬件上，PFLD 的探针也是可实现的。
+
+**EN:**
+Functional correctness and probing benefits: We emulate a corruption drop rate of 0.001 at the receiver and verify that PFLD's retransmission count exactly matches the drop count across all variants, with no spurious retransmissions. Figure 17b compares the average FCT under a 1-second RTO timeout. RSS with only out-of-sequence detection suffers frequent timeouts for tail losses, as does PFLD with only retransmission probes. Adding tail probes eliminates these timeouts, reducing average FCT by up to 2.48× for 1 MiB messages and substantially more for smaller messages. The full PFLD configuration (all probe types) matches or improves on every variant, confirming the results from Section IV.
+
+**CN:**
+**功能正确性与探针收益**：在接收端模拟 0.001 的 corruption 丢包率，验证 PFLD 的重传次数在所有变体下都精确等于丢包次数、无伪重传。图 17b 在 1 秒 RTO 下比较平均 FCT：只有乱序检测的 RSS 会因尾部丢失频繁超时，只配重传探针的 PFLD 同样如此；加入尾部探针后这些超时消失，1 MiB 消息的平均 FCT 最多改善 2.48×，更小的消息改善更大。完整 PFLD 配置（全类型探针）在所有变体上持平或更优，印证了 §IV 的结论。
+
+> 精炼：这一节的定位很克制（"证可实现，不证性能"），但两点必须打折扣读：**loopback + 1 秒 RTO** 完全脱离 §V 的 12 μs RTT / 微秒级 RTO 语境，因此 2.48× 的加速只说明"机制有效"，不能外推到真实网络；DPU 型号保密则意味着第三方无法复现。反过来说，"重传次数严格等于丢包数、零伪重传"这一条是相当强的正确性证据。
+
+---
+
+## 7. 相关工作（§VII）
+
+**EN:**
+To maximize network utilization, the field has recently moved towards finer-grained load balancing. While flow-based schemes like Flowbender and PLB offer improvements over ECMP, their granularity is limited. Approaches that split flows, such as flowlet switching, trade load balancing precision for packet ordering, a compromise that is less effective for dense RDMA traffic which often lacks the idle intervals needed for rerouting. Per-packet schemes like RPS and DRB offer the best granularity but falter in asymmetric topologies or demand global network knowledge. DRILL, Adaptive Routing (AR) switch-based solutions, SGLB, and REPS, also proposed as part of UE, solve these issues to different degrees but introduce challenges: SGLB requires global switch coordination, AR demands switch modifications, and REPS struggles with ACK coalescing.
+
+**CN:**
+为最大化网络利用率，领域近年走向更细粒度的负载均衡。Flowbender、PLB 这类按流方案优于 ECMP，但粒度受限。拆分流的方法（如 flowlet switching）以负载均衡精度换取包序，这种折衷对密集 RDMA 流量效果较差——后者往往没有可供重路由的空闲间隔。RPS、DRB 等逐包方案粒度最佳，但在非对称拓扑下失效或需要全局网络知识。DRILL、基于交换机的自适应路由（AR）、SGLB，以及同样作为 UE 一部分提出的 REPS，在不同程度上解决了这些问题，却带来新挑战：SGLB 需要全局交换机协同，AR 要求改交换机，REPS 受困于 ACK 合并。
+
+**EN:**
+Ordered Chaos builds upon the evolution of these multipath transports by addressing key limitations in how these designs couple load balancing with loss detection. Early multipath approaches such as MPTCP primarily target bandwidth aggregation and resilience by operating multiple underlying TCP subflows, while relying on conventional per-flow path selection (e.g., ECMP) within the network. Ordered Chaos extends beyond this model by introducing RSS subflows that share a single connection context and by explicitly structuring load balancing to preserve controlled ordering, allowing loss detection to be integrated directly into the multipath design rather than layered atop replicated transport instances.
+
+**CN:**
+Ordered Chaos 建立在这些多路径传输的演进之上，针对的是"负载均衡与判丢如何耦合"这一关键局限。MPTCP 这类早期多路径方案主要面向带宽聚合与容错：它运行多条底层 TCP 子流，但在网络内部仍依赖常规的按流选路（如 ECMP）。Ordered Chaos 超越该模型之处有两点：RSS 子流共享**单一连接上下文**；并把负载均衡显式组织为"保留受控的序"，使判丢能直接内生于多路径设计，而不是叠加在多个传输实例之上。
+
+**EN:**
+Fine-grained load balancing inherently introduces out-of-order (OOO) packet arrivals. This breaks traditional RDMA reliability mechanisms like IRN, which conflate reordering with packet loss and trigger waves of spurious retransmissions. Recognizing this, some solutions rely on switch support for explicit loss notification. Works like NDP, CP, and more recently DCP for RDMA use packet trimming to have the switch convert a dropped data packet into a header-only notification. Link Guardian takes a complementary approach with link-local retransmission at the switch level, masking corruption losses before they reach the endpoint. While effective, these approaches require deploying new logic across the network fabric. More recently, MRC extends RoCEv2 with per-packet multipathing and selective reliability feedback over best-effort Ethernet; Ordered Chaos explores a complementary subflow-ordered design point.
+
+**CN:**
+细粒度负载均衡天然引入乱序到达，这会破坏 IRN 这类传统 RDMA 可靠性机制——它们把乱序与丢包混为一谈，触发成波的伪重传。有鉴于此，一些方案依赖交换机支持做显式丢包通知：NDP、CP，以及更近的 RDMA 版 DCP 用 packet trimming 让交换机把被丢的数据包转成仅含包头的通知；Link Guardian 走互补路线，在交换机层面做链路本地重传，在损坏丢包到达端点前就把它遮蔽掉。这些方法有效，但都要求在整个网络设备侧部署新逻辑。更近期，MRC 在尽力而为以太网上为 RoCEv2 扩展了逐包多路径与选择性可靠性反馈；Ordered Chaos 探索的是一个互补的"子流保序"设计点。
+
+**EN:**
+Other end-host solutions present their own trade-offs. For instance, to avoid spurious retransmissions with its Adaptive Routing, the NVIDIA SuperNIC relies on timeouts for loss recovery. Falcon pairs subflow-based multipathing with RACK-TLP for loss recovery, an architecture conceptually similar to RSS; however, RACK-TLP's sender-side heuristics degrade when subflows carry few packets. Other approaches either lack precision, like the predictive heuristics in STrack, or trade efficiency for reordering tolerance, like RACK-TLP itself, which delays retransmission by a full round-trip time and incurs significant memory overhead. MPRDMA addresses multipath congestion control and is orthogonal to our work; we use it as the congestion control layer in our evaluation.
+
+**CN:**
+其他端主机方案各有取舍。例如 NVIDIA SuperNIC 为在其自适应路由下避免伪重传，只能依赖超时做丢包恢复。Falcon 把基于子流的多路径与 RACK-TLP 组合，架构上与 RSS 概念相近；但 RACK-TLP 的发送端启发式在子流承载包很少时会退化。另一些方法要么缺乏精确性（如 STrack 的预测式启发式），要么以效率换乱序容忍（如 RACK-TLP 本身：把一个 RTT 的延迟作为代价，并带来可观内存开销）。MPRDMA 解决的是多路径拥塞控制，与本文正交；我们把它用作评估中的拥塞控制层。
+
+**EN:**
+Ordered Chaos complements the RACK-TLP approach by reshaping multipath load balancing itself: RSS distributes traffic at subflow granularity rather than per packet, retaining most of the benefits of dynamic spraying while preserving partial flow order with in-order delivery guarantees within each subflow. This preserved structure enables PFLD to provide receiver-driven, deterministic loss identification and precise recovery with minimal duplicate retransmissions, even under aggressive multipathing, and without reliance on timers, heuristic thresholds, or special switch features.
+
+**CN:**
+Ordered Chaos 与 RACK-TLP 是互补关系，因为它重塑的是多路径负载均衡本身：RSS 以子流而非逐包粒度分发流量，既保留动态喷洒的大部分收益，又通过"子流内保序"保住部分流序。这份被保留的结构，使 PFLD 能在激进多路径下仍提供接收端驱动的确定性判丢与精确恢复、且重复重传极少，同时不依赖定时器、启发式阈值或特殊交换机特性。
+
+> 精炼：相关工作把对手分成四类：① 按流/按 flowlet（粒度不足）；② 逐包喷洒（无序信号）；③ 交换机侧信令（NDP/CP/DCP/Link Guardian，需改网）；④ 端主机方案（Falcon+RACK-TLP、STrack、SuperNIC 超时兜底）。本文的生态位是"端主机 + 保序子流"这一空档。注意作者对 MRC 只用一句话处理（"complementary"），因为 MRC 是逐包多路径 + 选择性可靠性，恰好是本文对照的另一端；这也是本文与同实验室/同厂最新工作之间未被充分比较的地方。
+
+---
+
+## 8. 结论（§VIII）
+
+**EN:**
+The emergence of multipath-native transports, exemplified by specifications like Ultra Ethernet, signals an industry-wide shift towards best-effort out-of-order delivery to maximize network performance. However, this embrace of performance-oriented chaos creates a critical reliability gap, as fully out-of-order transports often lack robust mechanisms for fast and precise loss detection. In this work, we presented Ordered Chaos, a unified, end-host system that directly addresses this gap. Our design combines Reactive Subflow Spraying (RSS), which provides adaptive, fine-grained load balancing using ordered subflows, with Precise Fast Loss Detection (PFLD), which leverages order within flows and adds lightweight probing to rapidly identify losses from both congestion and corruption while being end-host only deployable. Our DPU-based prototype further confirms that PFLD's probing mechanism is practical for implementation on real hardware with negligible overhead. Additionally, our evaluation across microbenchmarks, AI collectives, end-to-end LLM training, and replayed HPC application traces demonstrates that this synergy significantly improves performance: RSS+PFLD improves tail flow completion time by up to 3×, reduces timeouts by up to 99%, and speeds up collective and training communication by up to 35%.
+
+**CN:**
+以 Ultra Ethernet 为代表的多路径原生传输的出现，标志着整个行业正在向"尽力而为、乱序交付"迁移以最大化网络性能。但这种"性能导向的混乱"造成了一个关键的可靠性缺口：完全乱序的传输往往缺乏快速、精确判丢的鲁棒机制。本文提出 Ordered Chaos——一个直接填补该缺口的统一端主机系统。它把提供自适应细粒度负载均衡的保序子流喷洒（RSS），与利用流内序并辅以轻量探针的精确快速丢包检测（PFLD）结合起来，能快速识别拥塞与损坏两类丢包，且纯端主机可部署。基于 DPU 的原型进一步确认 PFLD 的探针机制在真实硬件上可实现、开销可忽略。此外，跨微基准、AI 集合通信、端到端 LLM 训练与回放 HPC trace 的评估表明，这种协同显著提升性能：尾 FCT 最多改善 3×，超时减少最多 99%，集合与训练通信加速最多 35%。
+
+> 精炼：结论没有新增信息，但把全文的"命名逻辑"讲清楚了——标题里的 Ordered Chaos 就是"保留受控的序（ordered）+ 拥抱多路径的熵（chaos）"。这个命名也是全文的核心主张：序不必是全有或全无，可以是**部分保留、按子流分段保留**。
+
+---
+
+# Phase 4：深度分析
+
+## 9.1 关键实验数据速查
+
+| 维度 | 配置 / 结果 |
+|------|-------------|
+| 拓扑 | 2 层 fat-tree，1,024 节点，64 端口交换机，MTU 4 KiB，单链路 1.5 μs，最小 RTT 12 μs |
+| 链路 | 对称：全部 400 Gbps；非对称：16 台汇聚中 4 台全部链路降为 100 Gbps |
+| 默认丢包率 | corruption 5×10^-5（LLaMA 用 5×10^-4，HPC 回放用 5×10^-3，DC trace 底行 5×10^-3） |
+| 参数 | σ = 16，τ = 15 μs（≈1 RTT）；探针 P = 每 k 个数据包一个周期探针 |
+| 状态 | 每流 512-bit 位图；1000 活跃流 < 100 KiB/网卡（无限内存变体 ~480 KiB） |
+| 位图尺寸依据 | 400 Gb/s + 10 μs RTT：4 KiB MTU≈122 包，1 KiB≈489 包 |
+| 微基准 | 8:1 incast 1 MiB；Tornado 4 MiB；各 100 seeds；2×2（corruption × trimming） |
+| AI | ring all-reduce 8 MiB / 128 节点 ×100；all-to-all 1 MiB；RTO 统计用 4 MiB 有向流、≤32 活跃发送端 |
+| 收益 | incast P99 ≈ ECMP 的 1/2；tornado P99 2.5×；all-reduce ~20%（正文称 35%）；LLaMA 暴露通信 -28%；DC trace >1 MiB 中位 -41%；MILC 尾 FCT 1.6× vs RACK-TLP |
+| 超时 | incast/tornado：-99% vs ECMP；all-to-all：0.08 次/run（关 trim）/ 49.51（开 trim） vs RACK-TLP 149.42 / 132.49，其他 >221k |
+| 硬件 | DPU loopback，4 KiB–1 MiB，0.001 丢包，1 s RTO；tail probe 在 4 KiB 时 ~6% 开销，>128 KiB 趋 0；零伪重传；1 MiB 平均 FCT 最多 2.48× |
+
+---
+
+## 9.2 优势（Strengths）
+
+1. **问题定位有物理依据，不是"再优化一点"。** 全文的支点是"corruption drop 发生在 PHY/MAC、入队之前，因此 trimming 拿不到可 trim 的包头"。这是一个可验证的机制性事实，而不是性能观察，所以它撑得起"trimmng 不够"的结论。配套的生产数据（异常相关丢包中 18% 属此类、平均 161 分钟定位、每天 5K–60K 次链路翻转）也说明规模越大越躲不开。
+
+2. **状态压缩是真正的工程贡献。** 把"段起点"编码进 EV（`EV = low16(next PSN)`），一举消掉了 generation tracking：状态从 O(#paths × #gens) 降到每流 512 bit，而低 log2σ 位仍可反解子流。这类"用既有字段自描述"的技巧，比单纯加硬件表更有部署价值——它把新机制塞进了不需要新字段的包格式里。
+
+3. **接收端驱动的论证站得住。** 论文明确指出发送端只看到"ACK 没来"，而 ACK 合并、ACK 丢失、反向路径时延都会造成同样现象，因此必须靠 RACK-TLP 这类时间阈值；接收端则拥有"后来的包到了、更早的 PSN 没到"这一**正证据**。这是全文最本质的一句判断，也解释了为什么 PFLD 在尾部的收益大于中位数收益。
+
+4. **评估设计干净，尤其是 2×2 拆分。** 每个微基准都跑「corruption 有/无 × trimming 开/关」，于是可以读出：开 trim + 无 corruption 时 PFLD 并不占优（说明它不靠负载均衡赢）；关 trim + 有 corruption 时大幅领先（说明它赢在判丢）。这比只报一条 FCT 曲线有说服力得多。
+
+5. **基线选择有针对性。** 用「RACK-TLP + RSS」逼近 Falcon 架构，从而在同一负载均衡下隔离"接收端确定性判丢 vs 发送端启发式"——这是把本文贡献与 Falcon 区分开的关键实验设计。
+
+6. **部分结论足够坦诚。** 主动承认：all-reduce 的 P99 上 RACK-TLP 略快（4.1 vs 4.2 ms）、两者中位数几乎相同；HPC 真实 trace 给负载均衡的余量很小、端到端只有 1~2%；子流数增加可能变慢；小消息上探针有 ~6% 开销。
+
+7. **可部署路径具体。** UDP 源端口 / IPv6 flow label / UE entropy 字段三条现成通道，纯端主机，O(σ) 状态，512-bit 位图 —— 这些都能直接对照现有网卡能力评估，不需要"假设未来硬件"。
+
+---
+
+## 9.3 不足（Weaknesses）
+
+### A. 丢包模型过于理想化（最影响结论强度）
+
+**论文明确陈述**：仿真把 corruption 建模为按包独立的随机丢弃，默认 5×10^-5，并验证 10^-6~10^-4 定性一致。
+
+**我的判断（推论）**：真实损坏是**突发、相关**的（光模块劣化、FEC 码字整块失败、连接器抖动往往连续丢若干包，甚至成串丢同一子流的连续 PSN）。这会同时打到 PFLD 的三个薄弱点：① 连续缺口使位图跨度逼近 512 bit 窗口；② 探针本身更容易被同一突发吞掉（论文只用"探针更小所以更不易丢"定性带过）；③ 接收端 NACK 突发。论文没有 burst-loss 实验，也没有位图窗口被打满时的行为分析（只说"可换 1024 bit 或重叠代"）。这是我认为最该补的一组实验。
+
+### B. 硬件验证与主张不匹配
+
+**论文明确陈述**：DPU 原型为 loopback、无拥塞、RTO 设为 1 秒、消息 4 KiB–1 MiB、模拟 0.001 丢包；型号与规格保密。
+
+**我的判断**：1 秒 RTO 与仿真里 12 μs RTT、微秒级 RTO 完全不是一个语境，因此"2.48× 平均 FCT 改善"只能证明"机制在硬件上能跑通、且重传数严格等于丢包数、零伪重传"，**不能**外推真实网络收益。同时 loopback 无法检验：高 BDP 下接收位图的读写压力、探针在真实拥塞下的丢弃率、NACK 汇聚、以及与拥塞控制的相互作用。作者自己把目标限定为"可行性"，这个表述是诚实的，但摘要/引言把它们与仿真数字并列时容易让读者高估硬件成熟度。
+
+### C. 关键对照缺失
+
+- **MRC 只有一句话**。MRC 是同一批机构（Microsoft + 同生态）在尽力而为以太网上做的逐包多路径 + 选择性可靠性反馈，是本文最直接的"另一设计点"。不做定量对比，读者无法判断"子流保序"相对"逐包 + 选择性反馈"的净收益。
+- **无"理想判丢"上界**。缺少 `RSS + oracle loss detection` 这一条曲线，就无法把"负载均衡带来的收益"与"判丢速度带来的收益"彻底分离（现在只能靠 RSS-only vs RSS+PFLD 间接推）。
+- **拥塞控制固定为 MPRDMA**。与 Swift / DCQCN / TIMELY 的交互未知；快速 NACK 会不会让窗口式 CC 过度反应，也没有讨论。
+- **trimming 只作为开关**，没有与完整的 DCP/UE 式 trim+NACK 可靠性实现对比。
+
+### D. 隐含契约与失效模式
+
+1. **EV→路径钉死契约。** PFLD 的确定性完全依赖"同 EV 必走同一物理路径"。若交换机启用自适应路由（AR）或对同一 EV 内部再做逐包分散，子流内就会乱序，PFLD 会把乱序判成丢包（伪 NACK）。论文在 §III-C 只说"网络隐藏路径选择时不适用"，但没有给出**运行期契约违约的检测手段**。这在 UE 生态里是现实风险：UE 恰恰鼓励 AR。
+2. **EV 空间被切薄且可预测。** σ=16 时每子流只有 4096 个 EV，且 EV = low16(PSN) 意味着同一时刻启动的多条流会得到高度相关的 EV 值——这与 RSS 用 jitter 防止"重路由时刻同步"的初衷相冲突（jitter 只抖动时间，不抖动 EV 值）。论文承认"两个 EV 在差路径上碰撞可再重路由"，但没有给出碰撞率/极化程度的任何定量分析。
+3. **强依赖乱序 RDMA 栈与可写 EV。** 这不是缺陷，但把适用范围限定在新建 AI 集群，无法增量部署到存量保序网卡。
+4. **探针频率是硬开关，不是自适应。** 消融显示 32:1 incast 下 P=16 → 2.6k 次 RTO，P=1 → 48.1 次，差 50 倍；而 P=1 意味着"每个数据包后跟一个探针"，带宽/包率开销论文完全没给。也就是说：**要么探针太稀（判丢退化成 RTO），要么太密（开销未计量）**，中间的自动调节被留成 future work。这是我认为最实质的可用性缺口。
+5. **headroom 缓冲建议与"零交换机改动"有张力**。0.2% 低优先级队列虽小，但仍需配置交换机；论文把它标为 optional 是合理的，但 §IV-B 的可靠性论证实际上依赖它（否则探针会被一起丢掉）。
+
+### E. 数字口径问题（需向作者核对）
+
+- **"35% 集合通信加速"**：图 8 可读出的中位数是 5.0 ms → 4.0 ms（约 20%），P99 5.3 → 4.1/4.2（约 21~23%）。正文"about a 35% speedup"与图中读数不一致，可能取自其它消息大小或最差配置，但论文未标注口径。
+- **"up to 3× 尾 FCT"**：微基准实际是 incast P99 约 2×（"roughly half"）、tornado P99 2.5×；3× 最可能来自图 13 的 HPC p99（相对 ECMP，纵轴到 4× 而实际峰值约 3×）——**此为推论，论文未明示该数字的出处**。三处场景不同、基线不同，摘要把最大值当统一卖点。
+- **"99% 超时消除"**：在 incast/tornado 与 all-to-all（0.08 vs 221k）成立；但开 trimming 时 PFLD 是 49.51 次/run，仍是 RACK-TLP 的 1/3，却不再是"99%"。论文没有解释为什么**开了 trimming 反而让 PFLD 的 RTO 从 0.08 涨到 49.51**——最可能的解释是 trim 通知与 PFLD 缺口检测产生重复 NACK/重传，属于"双信令互相干扰"，这是个值得追的机制问题。
+
+### F. 缺少理论支撑
+
+RSS 被明确称为"as a control system"，但只有定性讨论（τ 太小样本不足、太大收敛慢、jitter 防同步）。没有：多流共存下的稳定性分析、收敛性证明、"只搬最差一条"在级联非对称下的收敛速度界、NACK 风暴的抑制分析、位图窗口回绕的正确性论证。对 SC 这类偏系统的会议可以接受，但意味着参数（σ=16、τ=1 RTT、P）只能靠经验迁移。
+
+---
+
+## 9.4 开放问题（可直接立项）
+
+1. **AR fabric 下的序契约**：若交换机在 EV 内自适应换路，PFLD 如何区分"路径切换导致的乱序"与"真丢"？能否用 RTT 跳变/路径指纹做契约违约检测，并退化为 RACK-TLP？
+2. **突发损坏（bursty corruption）**：按 Gilbert-Elliott 或实测 FEC 失败序列建模，512-bit 位图与探针机制在 burst 长度 10/100/1000 包时的表现？需要多大位图/多少代重叠？
+3. **探针开销的闭式刻画与自适应**：给定流量节奏、σ、RTT，如何选 P 使"每比特开销"与"RTO 概率"的乘积最小？论文只给了消融表，没给模型。
+4. **与 MRC / UE 原生 OOO 栈共存**：两套可靠性信号（选择性反馈 vs 子流缺口 + 探针）如何避免重复重传与 NACK 放大？
+5. **多租户与哈希公平**：RSS 用 4096 个 EV/子流，与未修改的 ECMP 流共存时是否造成链路极化和不公平？需要全网流量矩阵级实验。
+6. **接收端规模化**：单网卡 1 万条活跃流时，位图内存、NACK 生成速率、per-flow 状态查找的可行边界。
+7. **与拥塞控制的耦合**：快速 NACK 触发的重传是否会让窗口式 CC（MPRDMA/DCQCN）误判为"丢包=拥塞"而缩窗？是否需要显式区分 corruption 与 congestion 并只对后者降速？（论文提到精确恢复动作，但没展开 CC 反应。）
+
+---
+
+## 9.5 可复现性评估
+
+| 项目 | 状态 | 说明 |
+|------|------|------|
+| 仿真器 | 可获取 | htsim（公开包级模拟器，论文引用 [31]）；ATLAHS 为 SPCL/ETH 的 SC'25 工具链 [38] |
+| 拓扑/参数 | 较完整 | 1024 节点、64 端口、400 Gbps、4 KiB MTU、1.5 μs、12 μs RTT、σ=16、τ=15 μs、丢包率均给出 |
+| 随机性 | 说明充分 | 每配置 100 seeds、报告跨 seed 变化可忽略（RTO 实验） |
+| trace | 公开 | [49] 指向 SPCL（ETH）公开 trace 仓库 https://storage2.spcl.ethz.ch/traces/，含 LLaMA/DLRM 等；HPC MPI trace 是否同仓未在正文说明 |
+| 代码/工件 | **未提及** | 正文无 artifact 链接或开源声明（SC 通常有 artifact 流程，可能在附录/评审版中） |
+| 硬件 | **不可复现** | DPU 型号与规格因保密未披露，仅描述"可编程数据通路 + DPU 内存" |
+| 缺失参数 | 若干 | 交换机缓冲大小、MPRDMA 窗口/ECN 细节、all-to-all 并行连接数、探针字节开销、RTO 具体取值 |
+
+结论：**仿真部分可复现性中上**（参数与基线都写得比较实，htsim 公开），**硬件部分不可复现**。若做后续工作，建议直接基于 htsim 复刻 §V-B 的 2×2 矩阵作为基线。
+
+---
+
+## 9.6 零散观察
+
+- **命名即主张**：Ordered Chaos = "有序的子流" + "混乱的多路径"。这个名字比技术名更能表达"部分保留序"的设计哲学。
+- **与 Falcon 的关系被处理得很巧**：不直接比较 Falcon（专有），而是用 RSS+RACK-TLP 逼近其架构，从而把"判丢机制"变成唯一变量。这是系统论文里处理"闭源对手"的标准做法。
+- **§V-B 的灰色虚线（理想 FCT）** 是个好习惯：读者能立刻看出各方案离理论上限还有多远。
+- **图 9 的"跳数分层"现象**值得注意：有 PFLD 时 FCT 聚成少数几个值（按 2 跳/4 跳），说明 ring 重新同步；无 PFLD 时呈混沌。这是比 FCT 分布更有说服力的"同步性"证据，也是全文唯一直接展示"集合通信失步"的图。
+- **AI 使用声明**：明确写了用 ChatGPT 5.4 与 Claude Opus 4.6 做全文编辑，并声明思想与内容为作者原创——SC'26 已要求此类披露，值得在自己的投稿中留意同类政策。
+- **资助结构**：NRF Singapore 的 AI Visiting Professorship（AIVP-2025-005）+ ERC PSAP（101002047）+ CSCS 算力。跨国（瑞士/新加坡/美国）资助组合，说明这类"端主机传输"研究正在被 AI 基础设施预算直接支持。
+- **一个未被讨论的替代设计**：既然接收端已有每流 512-bit 位图，能否把"探针"换成"接收端主动拉取（pull）"或"周期性 NACK 汇总"？论文选择了发送端探针，可能是为了保持发送驱动的重传语义，但这条设计轴没被探索。
+- **与 MRC 的时间线**：本文（2026-10）与 MRC（2026-05）几乎同期，且共享 Microsoft 作者圈；两篇实际上在回答同一个问题的两个方向（逐包 + 选择性反馈 vs 子流保序 + 探针）。把两篇并读，能看清 2026 年"尽力而为多路径可靠性"这一小领域的完整设计空间。
+
+---
+
+## 9.7 一页结论（给快速读者）
+
+- **一句话**：把"序"当作可调资源——用 16 条保序子流换取细粒度负载均衡，再用子流内缺口 + 探针把丢包判定从"等超时"变成"一次 RTT 内的确定性推断"。
+- **最硬的贡献**：`EV = low16(PSN)` 的自描述段起点 + 每流 512-bit 位图，把判丢状态压到可上网卡的量级；接收端"正证据"论证。
+- **最硬的证据**：all-to-all 上 RTO 从 22 万次/run 降到 0.08 次/run（关 trimming），且无伪重传（DPU 上重传数严格等于丢包数）。
+- **最大的保留**：全规模结果来自独立随机丢包的 htsim 仿真；真实损坏是突发的，硬件原型是 loopback + 1 s RTO，两者之间的空白没有被填。
+- **最该追问的问题**：当网络自己开始自适应换路（UE/AR）时，"同 EV 同路径"的契约还能维持吗？如果不能，PFLD 的"确定性"还剩多少？
