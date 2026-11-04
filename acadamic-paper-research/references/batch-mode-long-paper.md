@@ -73,7 +73,7 @@ EOF
 
 ## 5. 产出目录
 
-主目录 = Obsidian 库 `/mnt/d/ObsidianWorkspace/Academics/<paper>/`：
+主目录 = `~/Academics/<paper>/`（唯一写入位置；`/mnt/d` 的 Obsidian 库已于 2026-11 删除）：
 
 ```
 <paper>.pdf

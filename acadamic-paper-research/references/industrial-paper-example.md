@@ -1,7 +1,7 @@
 # Example: High-author-count Industrial Paper (NSDI)
 
 Paper: Bifrost (NSDI'26), 28 authors from 4 institutions
-Full analysis at: /mnt/d/ObsidianWorkspace/Academics/Bifrost_NSDI2026/
+Full analysis at: ~/Academics/Bifrost_NSDI2026/
 
 Key characteristics of this analysis:
 - Industrial paper with 28 authors: use table format for authors, group by institution

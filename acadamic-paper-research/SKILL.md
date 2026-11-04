@@ -73,12 +73,11 @@ metadata:
 1. 备份：`tar czf ~/backups/academics-md-backup-$(date +%Y%m%d-%H%M).tgz --exclude='*.pdf' --exclude='.git' --exclude='.obsidian' ~/Academics`
 2. 先 dry-run：`python3 scripts/reorg_paper_dirs.py`（脚本幂等；打印每个 MOVE/GEN，不做任何写操作）
 3. 确认无误再 `--apply` 落盘；脚本会：散落的全文/译文收进 `.pages/`、多文档按 PDF 名分子目录、缺失的 `page_NN.txt`（pymupdf 逐页）与 `fulltext.txt`（`===== PAGE N =====` 分页）补齐。
-4. 改引用路径（见上）→ 自检 → 需要时才 `git commit`。
+4. 改引用路径（见上）→ 自检 → 保持未提交状态，等用户下令再 `git commit`。
 5. 自检口径：`find <论文> -maxdepth 1 -type f` 顶层应只剩 PDF/笔记/图/PPT；`find <论文>/.pages -type f | wc -l` 数量与 PDF 页数吻合；`git status` 只应看到 `*_fulltext.txt` 一类旧文件的删除与笔记修改。
 
 - 主目录 `/home/dxl/Academics/` 在 ext4 上，读写无 drvfs 开销，逐页文本可直接写盘。
-- 主目录是 git 仓库（remote: `github.com/dxl041/Academics`，branch `main`）。每篇分析完成并写入后，顺手提交一次：
-  `git -C /home/dxl/Academics add -A && git -C /home/dxl/Academics commit -m "<论文简称>: 分析笔记"`。
+- 主目录是 git 仓库（SSH remote: `git@github.com:dxl041/Academics`，branch `main`）。**不要主动 git add/commit/push**——用户明确要求：只有他下令时才提交。写完笔记后把改动留在工作区即可，并在回复里说明"未提交改动 N 个文件"，由用户决定何时提交。
   已配 `.gitignore` 排除 `.pages/`、`.obsidian` 状态、`.dsh-cache/`、系统噪声文件；PDF 与笔记正常入库。
 - 本 skill 的仓库副本 `~/Academics/acadamic-paper-research/` 只是快照（为推 GitHub 而存），**Hermes 运行时只加载 `~/.hermes/skills/academics/acadamic-paper-research/`**；改完本文件后用 `rsync -a --delete ~/.hermes/skills/academics/acadamic-paper-research/ ~/Academics/acadamic-paper-research/` 同步快照。
 

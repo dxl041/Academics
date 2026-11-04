@@ -24,7 +24,7 @@
 ## 产出物组织
 
 ```
-/mnt/d/ObsidianWorkspace/Academics/<CONF>/
+~/Academics/<CONF>/
 ├── program_papers.md           ← 完整论文日程目录
 ├── analysis.md                 ← 热点领域综合分析
 ├── paper_analysis_part1.md     ← 逐篇四要素分析 Part 1
