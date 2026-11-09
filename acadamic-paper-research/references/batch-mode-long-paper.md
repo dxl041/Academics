@@ -77,8 +77,9 @@ EOF
 
 ```
 <paper>.pdf
-running_notes.md
-.pages/            # 逐页提取文本，点开头 → Obsidian 不索引
+running_notes.md   # 要点 + 深度分析（不放逐段翻译）
+.pages/            # 中间产物，点开头 → Obsidian 不索引
+  译文_中英对照.md  # 逐段 EN/CN 译文放这里
 ```
 
 `/mnt/d` 是 drvfs(9p)，小文件写慢：逐页 txt 可以先落 `/tmp` 再整体移入 `.pages/`。
