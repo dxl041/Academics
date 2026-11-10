@@ -1,6 +1,7 @@
 # Ordered Chaos 论文分析笔记
 
 > 逐段中英对照译文见 `.pages/译文_中英对照.md`；本文只保留要点与深度分析。
+> 技术疑问与答复见 `疑问.md`。
 
 > 论文：Ordered Chaos: Towards Adaptive Multipath Load Balancing with Precise Fast Loss Detection
 > 会议：SC'26（Supercomputing 2026，2026-11-15~20，Chicago, Illinois, USA）｜arXiv:2610.41707v1 (cs.NI, 2026-10-30)
