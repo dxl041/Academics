@@ -1,7 +1,7 @@
 ---
 name: acadamic-paper-research
 description: "学术论文综合分析：目录规范、元数据提取（会议/作者/课题组）、逐段中译+精炼笔记、深度分析（优缺/可复现性）。适用于会议论文全流程分析。"
-version: 2.3.0
+version: 2.4.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -48,7 +48,7 @@ metadata:
     ├── *.pptx                    ← 组会汇报等二次产出
     ├── image*.png                ← 被 running_notes 内嵌引用的插图
     └── .pages/                   ← 中间产物（点开头，Obsidian 不索引、git 不跟踪）
-        ├── 译文_中英对照.md      ← **逐段 EN/CN 译文放这里**，不写进 running_notes
+        ├── 译文_中英对照.md      ← **逐段 EN/CN 全文译文放这里**，不写进 running_notes；各论文统一同名（片段/章节级译文另用 `译文_中英对照_Sec5.md` 这类后缀，仍属中间产物）
         ├── fulltext.txt          ← 全文（`===== PAGE N =====` 分页标记）
         ├── page_NN.txt           ← 逐页文本
         └── *_翻译*.md            ← 其他译文/中间产物
@@ -79,7 +79,7 @@ metadata:
 
 - 主目录 `/home/dxl/Academics/` 在 ext4 上，读写无 drvfs 开销，逐页文本可直接写盘。
 - 主目录是 git 仓库（SSH remote: `git@github.com:dxl041/Academics`，branch `main`）。**不要主动 git add/commit/push**——用户明确要求：只有他下令时才提交。写完笔记后把改动留在工作区即可，并在回复里说明"未提交改动 N 个文件"，由用户决定何时提交。
-  已配 `.gitignore` 排除 `.pages/`、`.obsidian` 状态、`.dsh-cache/`、系统噪声文件；PDF 与笔记正常入库。
+  `.gitignore` 只忽略 `.pages/` 里的可重建中间产物（`fulltext.txt`、`page_NN.txt`、翻译分片、片段级译文等），**只有全文译文 `.pages/译文_中英对照.md` 入库**；`.obsidian` 状态、`.dsh-cache/`、系统噪声文件忽略；PDF 与笔记正常入库。
 - 本 skill 的仓库副本 `~/Academics/acadamic-paper-research/` 只是快照（为推 GitHub 而存），**Hermes 运行时只加载 `~/.hermes/skills/academics/acadamic-paper-research/`**；改完本文件后用 `rsync -a --delete ~/.hermes/skills/academics/acadamic-paper-research/ ~/Academics/acadamic-paper-research/` 同步快照。
 
 ---
@@ -100,6 +100,10 @@ wget -q -O /path/to/paper.pdf "<pdf_url>" -T 60
 ```
 
 **关键坑**：curl 在代理/跨境网络下可能超时（30s 不够），直接用 `wget -T 60` 更可靠。
+
+### 方法零：arXiv HTML 版（arXiv 论文先跑这一条）
+
+先取 `https://arxiv.org/html/<id>v1`（LaTeXML 版）。章节树、表格、编号列表都是干净结构，**符号型表格（●/◐/○ 评分格）和合并单元格在 pymupdf/pdftotext 流式提取里会塌成空格、`#`、错位列归属**，HTML 版能原样读出。用途是「校对与补表」：正文精读、页码、图注仍以 PDF 为准。`web_extract("https://arxiv.org/pdf/<id>")` 返回的 arXiv 阅读器 markdown 同样可用来补表。
 
 ### 方法一：pdftotext（两栏论文推荐）
 
@@ -213,7 +217,15 @@ grep -anE '^(I|II|III|IV|V|VI|VII|VIII|IX|X)+\. [A-Z]|^[A-H]\. [A-Z]' fulltext.t
 
 一条命令即可拿到完整层级（实测 Ordered Chaos/SC'26 一次命中 8 章 + 全部 A–F 小节），无需三级回退。判据：PDF 首页出现 `979-8-xxxxx/xx/$31.00 ©20xx IEEE` 版权行、或作者块为"名字 + 上标 ∗†‡§"的 IEEE 样式。若罗马数字正则只命中 `I.`/`V.` 少数几条，说明标题被拆行 → 改用"纯罗马数字行 + 下一行标题"配对。参考文献条目（`V. Wang, ...`、`D. Goel, ...`）同样会命中，行号落在 References 之后的直接丢弃。
 
-确认非罗马数字体系后，再走下面的阿拉伯数字流程。全文提取后，用 grep 快速定位论文章节：
+确认非罗马数字体系后，再走下面的阿拉伯数字流程。**先判阿拉伯数字的子型**：一级 `N. Title`、二级 `N.M. Title`（编号后带句点，arXiv 技术报告、DeepSeek/OpenAI 类 report 常见）时，下面两条正则**都会失配**——`^[0-9]+ [A-Z][a-z]` 要求数字后紧跟空格，`[0-9]+(?:\.[0-9]+)? [A-Z]` 不允许再跟句点。这种论文一条命令拿全层级：
+
+```bash
+grep -anE '^[0-9]+(\.[0-9]+)?\.? +[A-Z][A-Za-z]' .pages/fulltext.txt
+```
+
+两个坑：① **别在这条 grep 后面再管道过滤「以数字开头的行」**——标题本身就以数字开头，过滤会把全部命中吞掉，表现为「正则什么都没匹配到」，很容易误判成「标题被拆行」而去白跑三级回退；② 结果稀疏时用章节名白名单兜底，最快且几乎不漏：`grep -an 'Introduction\|Related Work\|Conclusion\|Evaluation\|Implementation\|Design\|Background\|Motivation\|Discussion\|References' fulltext.txt`。
+
+全文提取后，用 grep 快速定位论文章节：
 
 ```bash
 grep -anE '^[0-9]+ [A-Z][a-z]' paper_fulltext.txt | head -50
@@ -341,7 +353,7 @@ Shepherd 栏改为 `- **Shepherd**: 无（预印本）`
 批处理模式下：
 - 仍然执行 Phase 1（文本提取）和 Phase 2（元数据提取），不可跳过
 - 元数据（Phase 2 输出）先展示给用户确认，确认后继续
-- 之后一次性完成：全部章节翻译精炼 + Phase 4 深度分析 → 直接写入 running_notes.md
+- 之后一次性完成：全部章节翻译 + 精炼 + Phase 4 深度分析。落地时分两个文件：译文进 `.pages/译文_中英对照.md`（可先把「要点+完整译文」拼成 `/tmp` 草稿，再用 `scripts/split_bilingual_notes.py` 拆分），`running_notes.md` 只写要点、精炼与深度分析
 - 使用 delegate_task 并行提取多篇文档（如论文+配套白皮书）以加速
 - 对长论文（15+页/多文档）优先用 delegate_task 并行派发提取任务，父代理汇总分析
 - 笔记结构与交互模式相同（论文一页版总结、摘要、逐章笔记、深度分析），只是不逐章停顿等待
@@ -352,7 +364,7 @@ Shepherd 栏改为 `- **Shepherd**: 无（预印本）`
 ### 3.1 逐章翻译（必须交互，不能批处理）
 
 - **翻译粒度**：默认以整章为单位一次性展示翻译（用户偏好全章翻译，不必逐段拆开）。用户说"直接翻译introduction"时即按整章输出。不要逐段展示后再等确认，除非用户明确要求逐段。
-- **翻译格式**：默认纯中文翻译。用户说"中英文对照（着）"时，使用交替对照格式：先一段原文（EN: 开头），接一段译文（CN: 开头），段落间空行分隔。子节标题保留英文，正文 EN/CN 交替。**若用户画像/记忆中已记录"偏好中英对照"**：不要默认纯中文开译——在 Phase 2 元数据确认环节顺带问清翻译格式（与元数据确认合并为一次 clarify 即可，DynamiQ 会话验证有效），用户选定后整章照此执行。**注意**：一旦用户在本会话提出中英对照要求，后续所有章节默认沿用该格式，无需再次询问（MRC_SRv6 会话中用户对 §2 起每章都要求"中英文对照着"）。
+- **翻译格式**：**默认就是中英对照**（用户 2026-11 定的长期规矩），不必再问。每段先原文（`**EN:**`）接译文（`**CN:**`），段落间空行隔开；子节标题保留英文。只有用户明确说"只要中文"时才纯中文。文件名固定 `.pages/译文_中英对照.md`（各论文同名，不冲突）。
 - 翻译忠实原文，保留技术术语英文（如 ECMP、VXLAN-GPE）
 - 等用户确认翻译无误后再进入下一章
 - **确认信号**：用户说"继续"、"继续翻译"、"下一章"即表示当前章确认通过。无需显式追问"有需要调整的吗"——直接等用户指令即可。
@@ -363,6 +375,8 @@ Shepherd 栏改为 `- **Shepherd**: 无（预印本）`
 - 翻译确认后 → 先 append 到 `.pages/译文_中英对照.md`（按 `## 章号 标题` + `**EN:**/**CN:**` 组织，便于日后核对原文）
 - 用户要求"记录到笔记" → 在 `running_notes.md` 写该章精炼：3-6 条要点 + 原有 `> 精炼` 判断，100-300 字量级
 - 不要把小节标题留空：某小节没有独立要点就并进章级要点，别保留空 `###` 标题
+- **历史上已写成双语的笔记要"拆"而不是重写**：`python3 scripts/split_bilingual_notes.py <paper_dir>` 先 dry-run（报告配对数、要删的空小节、表格行数变化），确认后加 `--apply`；脚本自动备份笔记、把译文按 `## 章号` 落到 `.pages/译文_中英对照.md`。
+  四个必查项：① 拆完笔记里 `**EN:**`/`**CN:**` 必须为 0；② 译文要入库，文件名必须是 `译文_中英对照.md`（片段级加后缀则不入库，见上）；③ 原文紧跟 CN 段的表格/图注容易被一并吞掉，靠表格行数对比兜底，丢了就从 PDF 重建为"要点表"（OrderedChaos 的 Table I 就是这么补回的）；④ `**EN:**` 与 `**CN:**` 之间有一个空行，解析必须先跳空行再匹配，否则 CN 正文全丢（本会话真实发生，靠 `git show <sha>:<path>` 取回上一版才救回）。
 
 ### 3.3 Q&A 同样记录
 
@@ -420,7 +434,10 @@ Shepherd 栏改为 `- **Shepherd**: 无（预印本）`
 |------|--------|
 | PDF 提取 | PyPDF2 必须用 `terminal` 而非 `execute_code` |
 | PDF 下载 | curl 30s 超时不够 → 用 `wget -T 60` 回退 |
-| 目录 | PDF 必须放 `<name>/<name>.pdf`（主目录 `/home/dxl/Academics/`），不能放根目录；逐页文本/译文进 `.pages/` |
+| 目录 | PDF 必须放库内 `<name>/<name>.pdf`，不能放根目录；提取文本/译文进 `.pages/`；**收尾报告第一段先写产出绝对路径 + 放置理由**（用户会直接问"放哪了、为什么"） |
+| 目录归属 | 主目录会在会话之间被用户搬动（如迁到 D 盘 Obsidian 库后又整库删除）。**回答"文件在哪"前先 `pwd` + `ls -ld` 实测**，不信会话开头的 cwd；改规范时同步 skill Phase 0 + memory，并 `grep -rn 旧路径 ~/.hermes/skills ~/Academics/acadamic-paper-research` 全库清扫（实测漏了 6 处）。详见 `references/library-layout-and-git.md` §3/§7 |
+| 交互效率 | 用户会抱怨「怎么这么慢」：验证别拆成 5~6 次终端往返（一条 `bash -c` 串起 pwd/ls/df/git log/git status/grep）；别 `find /mnt/d` 全盘扫（9p 慢）；push 前先 `timeout 10 git ls-remote origin` 探路，https 挂起就改 SSH remote。详见该 reference §8 |
+| 双胞胎目录 | 两个路径子目录名/文件大小/mtime 完全一致 ≠ 同一目录。用 `readlink -f` + `stat -c '%d:%i'` 判定（dev 不同即两份拷贝）；删副本前做文件级 `comm` 对比 + `git status/ahead-behind/ls-remote`，且**"只在一侧存在"的目录可能是用户主动删除，先问再动** |
 | 笔记写入 | 用户可能自行编辑 → 每次写入前 `read_file` 确认当前状态 |
 | 长笔记分块拼装 | 批处理模式一次产出 600+ 行双语笔记时，分块写 `/tmp/<paper>_p1.md … pN.md` 再 `cat p1 p2 … > running_notes.md`，避免单次 write_file 过大或中途失败丢全稿。拼装后必须检查每个 `---` 前一行为空：`正文\n---` 会被 Markdown 解析成 setext 二级标题，把上一段变成标题。可用 python 逐行补空行并复查计数为 0 |
 | 章节发现（IEEE 风格） | SC/INFOCOM/HPCA/部分 ToN 等 IEEE 模板用罗马数字一级标题 + 大写字母二级标题，`^[0-9]+ [A-Z]` 全部失配（只会命中图轴刻度、表号噪声）。先跑 `^(I\|II\|III\|IV\|V\|VI\|VII\|VIII)\. [A-Z]` 和 `^[A-H]\. [A-Z]`，一条命令即得完整层级（见 §2.4 第 0 步） |
@@ -440,10 +457,13 @@ Shepherd 栏改为 `- **Shepherd**: 无（预印本）`
 | 章节发现 | grep `^[0-9]+ [A-Z][a-z]` 对 PDF 提取文本可能失败（章节标题不在行首）。回退用 Python `re.findall(r'[0-9]+(?:\\.[0-9]+)? [A-Z][A-Za-z]', full)` 配合长度过滤。**关键**：正则回退会匹配大量噪声（日期如 "5 May"、数字单位如 "32 KB"、引用如 "2015 ACM"）。必须将候选集去重排序后逐一人工验证——用候选数字去原文中提取周围几行上下文，确认确实是章节标题而非噪声。绝不能因为候选列表含噪声就直接判定某章节不存在。**特别注意页边界**：章节标题可能在页尾（end of page N）而不在页首，阅读原文时必须扫描页面尾部。**章节编号跳号（如 §3 直接到 §5）不代表缺章**——很可能是漏检（案例：MRC 论文 §4 Inter-plane Loading 被漏过，用户指出后才找到），发现跳号时逐页核对。 |
 | 标题拆行/标题行丢失 | 标题可能被拆成相邻两行（数字 "3.7" 单独一行、标题 "Performance under EEVDF" 在下一行）→ 单行正则漏检；PyPDF2 可能整体丢弃个别标题行（案例：HostStackLatency 的 §3.7/§4 标题在 PyPDF2 文本中完全缺失，pymupdf `get_text('text')` 重建后恢复）。排障顺序：① 搜纯数字行 `^\d+(\.\d+)?$` 并配对下一行文本 ② 结构仍有缺口时用另一提取器重建全文再跑检测 ③ 仍缺才逐页核对原文。pymupdf 新版 `doc.pages` 是方法不是属性，遍历页用 `doc.page_count` + `doc[i]`（直接 `len(doc.pages)` 报 TypeError）。 |
 | grep 与 PDF 文本 | PyPDF2 提取的全文含控制字符，`grep -n` 会报 `binary file matches` 并停止搜索。始终用 `grep -an`（`-a` 强制文本模式）搜索 PDF 提取文本。 |
-| 多公司工业论文 | ≥3家公司的联合论文，作者按机构分组列表，各公司标注通讯作者。"课题组"栏改为"纯工业论文，无学术课题组"。
+| 多公司工业论文 | ≥3家公司的联合论文，作者按机构分组列表，各公司标注通讯作者。"课题组"栏改为"纯工业论文，无学术课题组".
+| 超大署名技术报告 | 100+ 作者（DeepSeek/OpenAI 类 report）**不要逐行列表**：写「总数 + 角色表」（第一作者 / 通讯作者 / 学术单位与导师关系，其余署名省略），并解释署名符号含义（∗通讯、†项目开发者、‡高校）。单作者单位既是大厂又是高校时（实习博士生），要点明「工业方主导、高校为实习合作」，不硬凑课题组。 |
+| 符号/合并单元格表格 | 评分表（●/◐/○）、多列特性表在流式提取里塌成空格、`#`、错位列归属；取 arXiv HTML 版（`arxiv.org/html/<id>v1`）校对后重建成要点表，不按塌陷文本猜列（见 Phase 1 方法零）。 |
 | 配套规范文档 | 论文引用配套规范文档（如 OCP Specification、IETF RFC）且论文对某些技术机制（如 EV-SRv6 映射、SACK 格式）描述不够详细时，提取规范文档对应章节辅助解释。规范 PDF 通常在论文同级目录，用 PyPDF2 读取其目录/关键章节即可。 | |
 | 独立规范文档 | 用户给的分析对象本身就是工业协议规范（如 ByteDance veRoCE spec、OCP MRC spec）而非学术论文：无会议/摘要/致谢/Shepherd，元数据改为版本+Revision History+许可+联系作者；规范页脚页码与 PDF 页码有固定偏移（先算偏移再规划章节提取）；联网无法核实配套论文时直接向用户确认范围，不反复重试；大章（>10 页）按子节分批展示但仍按一章确认/记录。详见 `references/protocol-spec-analysis.md` | |
 
+> **笔记/译文分家**: `references/notes-vs-translation-split.md` + `scripts/split_bilingual_notes.py` — running_notes 只放要点与分析，逐段 EN/CN 译文进 `.pages/译文_中英对照.md`；含拆分验收口径与"吞表格/空小节"三坑
 > **参考案例**: `references/industrial-paper-example.md` — 高作者数工业论文分析示例
 > **系统论文批评框架**: `references/systems-paper-critique.md` — Phase 4 的检查清单（数字溯源、消融读法、隐含契约、可复现性表、9.x 结构）
 > **多公司联合论文**: `references/multi-company-consortium-paper.md` — 5方联合大型工业论文分析案例（OpenAI+Microsoft+AMD+Broadcom+Nvidia MRC论文）
@@ -455,6 +475,7 @@ Shepherd 栏改为 `- **Shepherd**: 无（预印本）`
 > **Crossref 元数据提取**: `references/crossref-api.md` — ACM/EuroSys 论文的 Crossref API 使用（ORCID+精确机构，替代不可抓取的 ACM DL 页面）
 > **ACM PDF 获取（绕 403）**: `references/acm-pdf-acquisition.md` — dl.acm.org Cloudflare 拦截时的作者主页猎取流程（OpenAI 找 DOI → 实验室 people 页 → 合作教授主页；注意论文可能以项目代号列出，如 SID）
 > **工业协议规范分析**: `references/protocol-spec-analysis.md` — 分析对象为协议规范（非论文）时的元数据适配、规范页码↔PDF 页码偏移映射、pymupdf words 表格列还原、大章分批展示粒度
+> **库目录与 git 化**: `references/library-layout-and-git.md` — 双胞胎目录判别（readlink/stat dev:inode）、删副本前的安全检查清单、drvfs 上 `git init` 的三项 config、`.gitignore` 模板（必须忽略 `.obsidian/plugins/*/node_modules`）、**不主动 commit/push**、搬库后全库清扫旧路径（§7）、交互效率与 push 前探路（§8）
 > **图表数值提取**: `scripts/extract_figure_curves.py` + `references/figure-data-extraction.md` — 论文数据只画在曲线图里、或需核对图中数值时，用像素分析标定坐标轴并读各序列数值（网格线标定、系列配色分组、图例遮挡处理、已知值反校验）。运行须用 `terminal`（沙箱 Python 无 PIL）。
 > **编译用户自己的 .tex 工程**: 见独立 skill `latex-toolchain` — 装 TeX Live、PATH 接线、LaTeX Workshop 配置、latexmk 编译（含子集编译）、重编结果与原 PDF 一致性校验。本 skill 只负责「读论文」，编译投稿源码走那边
 
